@@ -1,0 +1,44 @@
+# Build context exclusions for deploy/Dockerfile.
+# The context is the Tree/ directory (parent of both repositories); paths are
+# relative to it. BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile,
+# and this file takes precedence over a .dockerignore in the context root; the
+# .dockerignore files inside the repositories do NOT apply with this layout, so
+# everything needed is listed here.
+
+# version control
+**/.git
+
+# dependencies and build artefacts - installed/built inside the image
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.pytest_cache
+**/.mypy_cache
+gramps-web/coverage
+
+# local caches and development data of the backend
+gramps-web-api/request_cache
+gramps-web-api/thumbnail_cache
+gramps-web-api/persistent_cache
+# 1.5 MB pytest log; not used by the gramps_webapi package
+gramps-web-api/semantic_index.txt
+
+# logs and local environment settings
+**/*.log
+**/.env
+**/.env.*
+
+# the deploy files themselves: the Dockerfile is passed to BuildKit separately,
+# nothing else is copied into the image
+gramps-web-api/deploy
+
+# other things not needed in the image
+**/.claude
+**/.idea
+**/.vscode
+**/.devcontainer
+**/.github
+**/.DS_Store

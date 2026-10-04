@@ -52,11 +52,13 @@ from .api.resources.schemas import (
     TagSchema,
 )
 from .api.search.embeddings import create_remote_embedding_function, load_model
-from .api.tasks import run_task, send_telemetry_task
+from .api.succession import should_check_now
+from .api.tasks import check_succession, run_task, send_telemetry_task
 from .api.telemetry import get_server_uuid, should_send_telemetry
 from .api.util import close_db, get_tree_from_jwt
 from .auth import user_db
 from .auth.oidc import init_oidc
+from .branch_guard import BranchPermissionError
 from .config import DefaultConfig, DefaultConfigJWT
 from .const import API_PREFIX, ENV_CONFIG_FILE, TREE_MULTI, VERSION
 from .dbmanager import WebDbManager
@@ -321,6 +323,12 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
             return e.response
         return api.handle_http_exception(e)
 
+    @app.errorhandler(BranchPermissionError)
+    def handle_branch_permission_error(e):
+        # the write was rolled back by the transaction; tell the user why
+        payload = {"error": {"code": 403, "message": str(e)}}
+        return payload, 403
+
     @app.errorhandler(HandleError)
     def handle_gramps_handle_error(e):
         # warning, not error: tree damage, not a server defect
@@ -335,6 +343,22 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
 
     # instantiate celery
     create_celery(app)
+
+    @app.before_request
+    def maybe_check_succession() -> None:
+        """Hand over roles of due succession plans, now and then."""
+        try:
+            interval = float(app.config.get("SUCCESSION_CHECK_INTERVAL") or 0)
+        except (TypeError, ValueError):
+            # a misconfigured interval disables the check, nothing more
+            interval = 0
+        if interval <= 0 or not should_check_now(interval):
+            return
+        try:
+            run_task(check_succession, tree=None)
+        except Exception:  # pylint: disable=broad-except
+            # never fail a request over this
+            _LOG.warning("Succession check failed", exc_info=True)
 
     @app.before_request
     def maybe_send_telemetry() -> None:

@@ -34,6 +34,7 @@ import click
 import waitress  # type: ignore
 
 from .api.search import get_search_indexer, get_semantic_search_indexer
+from .api.succession import evaluate_all_trees, evaluate_tree
 from .api.tasks import send_email_confirm_email, send_email_reset_password
 from .types import ProgressCallback
 from .api.util import close_db, get_db_manager, list_trees
@@ -237,6 +238,26 @@ def migrate_db(ctx):
     env = os.environ.copy()
     env["GRAMPSWEB_USER_DB_URI"] = app.config["USER_DB_URI"]
     subprocess.run(cmd, env=env, check=True)
+
+
+@cli.group("succession", help="Manage succession plans.")
+@click.pass_context
+def succession(ctx):
+    pass
+
+
+@succession.command("check")
+@click.option("--tree", help="Tree ID (default: all trees with plans)", default=None)
+@click.pass_context
+def succession_check(ctx, tree):
+    """Pick up recorded deaths and hand over roles where due."""
+    app = ctx.obj["app"]
+    with app.app_context():
+        results = evaluate_tree(tree) if tree else evaluate_all_trees()
+    for plan, events in results:
+        click.echo(f"Plan {plan.id} (tree {plan.tree}): {', '.join(events)}")
+    if not results:
+        click.echo("No changes.")
 
 
 @cli.group("search", help="Manage the full-text search index.")

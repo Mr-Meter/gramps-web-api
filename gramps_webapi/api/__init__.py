@@ -33,6 +33,7 @@ from .media import get_media_handler
 from .resources.access_tokens import UserAccessTokenResource
 from .resources.anniversaries import AnniversariesIcsResource
 from .resources.base import Resource, object_request_body
+from .resources.branches import BranchesResource
 from .resources.bookmarks import (
     BookmarkEditResource,
     BookmarkResource,
@@ -131,6 +132,14 @@ from .resources.reports import (
 from .resources.repositories import RepositoriesResource, RepositoryResource
 from .resources.search import SearchIndexResource, SearchResource
 from .resources.sources import SourceResource, SourcesResource
+from .resources.succession import (
+    SuccessionCancelResource,
+    SuccessionCandidatesResource,
+    SuccessionCheckResource,
+    SuccessionConfirmResource,
+    SuccessionPlanResource,
+    SuccessionPlansResource,
+)
 from .resources.tags import TagResource, TagsResource
 from .resources.tasks import TaskListResource, TaskResource
 from .resources.timeline import (
@@ -810,6 +819,42 @@ register_endpt(
     "/anniversaries.ics",
     "anniversaries_ics",
     tags=["Anniversaries"],
+)
+# Branches
+register_endpt(BranchesResource, "/branches/", "branches", tags=["Branches"])
+# Succession
+register_endpt(
+    SuccessionPlansResource, "/succession/", "succession_plans", tags=["Succession"]
+)
+register_endpt(
+    SuccessionCheckResource,
+    "/succession/check/",
+    "succession_check",
+    tags=["Succession"],
+)
+register_endpt(
+    SuccessionCandidatesResource,
+    "/succession/candidates/",
+    "succession_candidates",
+    tags=["Succession"],
+)
+register_endpt(
+    SuccessionPlanResource,
+    "/succession/<int:plan_id>/",
+    "succession_plan",
+    tags=["Succession"],
+)
+register_endpt(
+    SuccessionConfirmResource,
+    "/succession/<int:plan_id>/confirm/",
+    "succession_confirm",
+    tags=["Succession"],
+)
+register_endpt(
+    SuccessionCancelResource,
+    "/succession/<int:plan_id>/cancel/",
+    "succession_cancel",
+    tags=["Succession"],
 )
 # User
 register_endpt(UsersResource, "/users/", "users", tags=["Users"])

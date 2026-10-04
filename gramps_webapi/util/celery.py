@@ -4,6 +4,8 @@ from celery import Task
 from celery import current_app as current_celery_app
 from werkzeug.exceptions import HTTPException
 
+from ..branch_guard import BranchPermissionError
+
 
 class TaskError(Exception):
     """Task failure carrying an API-style error payload as its only argument.
@@ -37,6 +39,11 @@ def create_celery(app):
             with app.app_context():
                 try:
                     return self.run(*args, **kwargs)
+                except BranchPermissionError as exc:
+                    # a background write outside the user's branches: the
+                    # request's fault, like a 403 from a request
+                    payload = {"error": {"code": 403, "message": str(exc)}}
+                    raise TaskRejection(payload) from exc
                 except HTTPException as exc:
                     # Utilities like check_quota_people abort with an
                     # HTTPException inside tasks too; preserve the API error

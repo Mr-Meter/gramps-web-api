@@ -43,6 +43,8 @@ from gramps_webapi.api.search.indexer import SearchIndexer, SemanticSearchIndexe
 
 from ..auth import TaskTree, get_owner_emails
 from ..auth import user_db
+from ..branch_guard import BranchPermissionError
+from .succession import evaluate_all_trees, evaluate_tree
 from ..undodb import migrate as migrate_undodb
 from .check import check_database
 from .emails import email_confirm_email, email_new_user, email_reset_pw
@@ -129,7 +131,7 @@ def run_task(task: Task, **kwargs) -> Union[AsyncResult, Any]:
         with current_app.app_context():
             try:
                 return task(**kwargs)
-            except HTTPException:
+            except (HTTPException, BranchPermissionError):
                 # the task aborted with an API error - preserve status & message
                 raise
             except Exception as exc:
@@ -162,6 +164,13 @@ def clip_progress(x: float) -> float:
     if x < 0 or x >= 1:
         return -1
     return x
+
+
+@shared_task()
+def check_succession(tree: Optional[str] = None):
+    """Advance the succession plans of a tree, or of all trees with open plans."""
+    results = evaluate_tree(tree) if tree else evaluate_all_trees()
+    return [{"id": plan.id, "events": events} for plan, events in results]
 
 
 @shared_task()

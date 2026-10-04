@@ -52,6 +52,8 @@ class DefaultConfig(object):
     EMAIL_USE_STARTTLS = None
     DEFAULT_FROM_EMAIL = ""
     BASE_URL = "http://localhost/"
+    # seconds between checks of time-based succession plan steps; 0 disables
+    SUCCESSION_CHECK_INTERVAL = 600
     CORS_EXPOSE_HEADERS = ["X-Total-Count"]
     STATIC_PATH = "static"
     REQUEST_CACHE_CONFIG = {

@@ -1,0 +1,108 @@
+# Gramps Web, "Tree" fork: the image is built locally from the two sibling
+# repositories (see Dockerfile and README.md in this directory).
+#
+# Quick start:  cp .env.example .env  &&  docker compose up -d --build
+#
+# The layout follows the docker-compose.yml from the Gramps Web documentation
+# (grampsweb + celery + redis) and adds the optional grampsweb_succession
+# service. The ${...} values come from the .env file next to this one.
+
+name: tree
+
+# Common part of all containers running the Gramps Web image.
+x-grampsweb: &grampsweb
+  image: tree-grampsweb:local
+  restart: always
+  environment:
+    # name of the family tree; created on first start if it does not exist yet
+    GRAMPSWEB_TREE: ${GRAMPSWEB_TREE:-Tree}
+    # public address of the site: it ends up in e-mail links
+    # (including <BASE_URL>/settings/succession), hence required
+    GRAMPSWEB_BASE_URL: ${GRAMPSWEB_BASE_URL:?set GRAMPSWEB_BASE_URL in .env - the public address of the site}
+    # empty => the key is generated on first start and kept in the gramps_secret volume
+    GRAMPSWEB_SECRET_KEY: ${GRAMPSWEB_SECRET_KEY:-}
+    # succession: interval (s) between plan checks triggered by requests; 0 - off
+    GRAMPSWEB_SUCCESSION_CHECK_INTERVAL: ${GRAMPSWEB_SUCCESSION_CHECK_INTERVAL:-600}
+    # outgoing e-mail: e-mail confirmation, password reset, succession notifications
+    GRAMPSWEB_EMAIL_HOST: ${GRAMPSWEB_EMAIL_HOST:-localhost}
+    GRAMPSWEB_EMAIL_PORT: ${GRAMPSWEB_EMAIL_PORT:-465}
+    GRAMPSWEB_EMAIL_HOST_USER: ${GRAMPSWEB_EMAIL_HOST_USER:-}
+    GRAMPSWEB_EMAIL_HOST_PASSWORD: ${GRAMPSWEB_EMAIL_HOST_PASSWORD:-}
+    GRAMPSWEB_EMAIL_USE_SSL: ${GRAMPSWEB_EMAIL_USE_SSL:-true}
+    GRAMPSWEB_EMAIL_USE_STARTTLS: ${GRAMPSWEB_EMAIL_USE_STARTTLS:-false}
+    GRAMPSWEB_DEFAULT_FROM_EMAIL: ${GRAMPSWEB_DEFAULT_FROM_EMAIL:-}
+    # number of gunicorn worker processes (the image defaults to 8)
+    GUNICORN_NUM_WORKERS: ${GUNICORN_NUM_WORKERS:-4}
+    # task queue and rate-limit storage - as in the upstream compose file
+    GRAMPSWEB_CELERY_CONFIG__broker_url: redis://grampsweb_redis:6379/0
+    GRAMPSWEB_CELERY_CONFIG__result_backend: redis://grampsweb_redis:6379/0
+    GRAMPSWEB_RATELIMIT_STORAGE_URI: redis://grampsweb_redis:6379/1
+  depends_on:
+    - grampsweb_redis
+  volumes:
+    - gramps_users:/app/users              # users, branch administrators, succession plans
+    - gramps_index:/app/indexdir           # search index
+    - gramps_thumb_cache:/app/thumbnail_cache
+    - gramps_cache:/app/cache              # export and report caches
+    - gramps_secret:/app/secret            # Flask secret key
+    - gramps_db:/root/.gramps/grampsdb     # Gramps database
+    - gramps_media:/app/media              # media files
+    - gramps_tmp:/tmp
+
+services:
+  # site + API; the only service that builds the image
+  grampsweb:
+    <<: *grampsweb
+    container_name: grampsweb
+    build:
+      context: ../..                                # Tree/ - parent of both repositories
+      dockerfile: gramps-web-api/deploy/Dockerfile
+    ports:
+      - "${GRAMPSWEB_PORT:-80}:5000"                # host:container
+
+  # background tasks (export, reports, indexing, sending e-mail)
+  grampsweb_celery:
+    <<: *grampsweb
+    container_name: grampsweb_celery
+    pull_policy: never        # the image is built by the grampsweb service; it is not in a registry
+    depends_on:               # start after grampsweb: fewer migration races on first start
+      - grampsweb_redis
+      - grampsweb
+    command: celery -A gramps_webapi.celery worker --loglevel=INFO --concurrency=2
+
+  # OPTIONAL service: a safety-net background check of the succession plans.
+  # The web app checks the plans itself every GRAMPSWEB_SUCCESSION_CHECK_INTERVAL
+  # seconds, but only while somebody uses the site; this loop also runs when
+  # nobody has visited for a long time. Not needed - remove the service or
+  # stop it:  docker compose stop grampsweb_succession
+  grampsweb_succession:
+    <<: *grampsweb
+    container_name: grampsweb_succession
+    pull_policy: never
+    depends_on:
+      - grampsweb_redis
+      - grampsweb
+    # the entrypoint runs "user migrate" first, then this loop
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          python3 -m gramps_webapi --config /app/config/config.cfg succession check
+          sleep ${SUCCESSION_CHECK_EVERY:-3600}
+        done
+
+  grampsweb_redis:
+    image: docker.io/library/redis:7.2.4-alpine
+    container_name: grampsweb_redis
+    restart: always
+
+volumes:
+  gramps_users:
+  gramps_index:
+  gramps_thumb_cache:
+  gramps_cache:
+  gramps_secret:
+  gramps_db:
+  gramps_media:
+  gramps_tmp:

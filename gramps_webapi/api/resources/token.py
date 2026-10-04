@@ -41,6 +41,7 @@ from ...auth import (
     get_permissions,
     is_tree_disabled,
 )
+from ...auth.branches import get_branch_scope
 from ...auth.oidc_helpers import is_oidc_enabled
 from ...auth.const import (
     ACCESS_TOKEN_SCOPE_PERMISSIONS,
@@ -53,6 +54,7 @@ from ...auth.const import (
 from ...const import TREE_MULTI
 from ..blueprint import api_blueprint
 from ..ratelimiter import limiter
+from ..succession import auto_cancel_on_login
 from ..util import abort_with_message, get_tree_id_or_none, tree_exists
 from . import RefreshProtectedResource, Resource
 from .access_tokens import get_active_user_from_access_token
@@ -87,12 +89,21 @@ def get_tokens(
     fresh: bool = False,
     oidc_provider: str | None = None,
 ):
-    """Create access token (and refresh token if desired)."""
+    """Create access token (and refresh token if desired).
+
+    A user whose writes are restricted to branches gets a ``branches``
+    claim with the tag handles, so clients can tell which objects the
+    user may edit without another request. Unrestricted users (owners,
+    admins, users without branches) get no such claim.
+    """
     claims: dict[str, Any] = {"permissions": list(permissions)}
     if tree_id:
         claims["tree"] = tree_id
     if oidc_provider:
         claims["oidc_provider"] = oidc_provider
+    branch_scope = get_branch_scope(user_id)
+    if branch_scope is not None:
+        claims["branches"] = sorted(branch_scope)
     access_token = create_access_token(
         identity=str(user_id), additional_claims=claims, fresh=fresh
     )
@@ -196,6 +207,8 @@ class TokenResource(Resource):
         tree_id, permissions = get_tree_id_and_permissions(
             user_id=user_id, username=args["username"]
         )
+        # someone who knows the password is alive
+        auto_cancel_on_login(user_id)
         return get_tokens(
             user_id=user_id,
             permissions=permissions,

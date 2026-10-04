@@ -3061,6 +3061,13 @@ class UserSchema(_Base):
             " empty for treeless site admins."
         },
     )
+    branches = fields.List(
+        fields.Str(),
+        metadata={
+            "description": "Handles of the branch tags the user's write access"
+            " is restricted to; empty for unrestricted users."
+        },
+    )
     oidc_accounts = fields.List(
         fields.Nested(UserOIDCAccountSchema),
         metadata={
@@ -3075,6 +3082,141 @@ class UserSchema(_Base):
             " OIDC provider's display name. Only present in the user list"
             " if OIDC is enabled."
         },
+    )
+
+
+# ===========================================================================
+# Branches & succession
+# ===========================================================================
+
+
+class BranchUserSchema(_Base):
+    """A user, as shown in branch and succession listings."""
+
+    name = fields.Str(metadata={"description": "User name."})
+    full_name = fields.Str(allow_none=True, metadata={"description": "Full name."})
+    role = fields.Int(metadata={"description": "Integer role ID."})
+
+
+class BranchSchema(_Base):
+    """A branch of the tree: a tag and the users administering it."""
+
+    handle = fields.Str(metadata={"description": "Handle of the branch tag."})
+    name = fields.Str(
+        allow_none=True,
+        metadata={"description": "Name of the tag; null if the tag was deleted."},
+    )
+    color = fields.Str(allow_none=True, metadata={"description": "Color of the tag."})
+    users = fields.List(
+        fields.Nested(BranchUserSchema),
+        metadata={"description": "Users whose writes are restricted to this branch."},
+    )
+
+
+class SuccessionConfirmationSchema(_Base):
+    """A confirmation of a recorded death."""
+
+    user = fields.Nested(BranchUserSchema, metadata={"description": "Who confirmed."})
+    created_at = fields.Str(metadata={"description": "When (ISO 8601, UTC)."})
+
+
+class SuccessionPersonSchema(_Base):
+    """The person a succession plan is linked to, in brief."""
+
+    gramps_id = fields.Str(metadata={"description": "Gramps ID of the person."})
+    name = fields.Str(metadata={"description": "Display name of the person."})
+
+
+class SuccessionPlanSchema(_Base):
+    """A succession plan."""
+
+    id = fields.Int(metadata={"description": "Plan ID."})
+    tree = fields.Str(metadata={"description": "Tree ID."})
+    user = fields.Nested(
+        BranchUserSchema, metadata={"description": "The user the plan is for."}
+    )
+    person_handle = fields.Str(
+        allow_none=True,
+        metadata={"description": "Handle of the user's person in the tree."},
+    )
+    person = fields.Nested(
+        SuccessionPersonSchema,
+        allow_none=True,
+        metadata={
+            "description": "The linked person in brief; null if the plan has"
+            " no person, the person was deleted or the caller may not see them."
+        },
+    )
+    required_confirmations = fields.Int(
+        metadata={"description": "Confirmations needed before the handover."}
+    )
+    grace_days = fields.Int(
+        metadata={"description": "Days between the confirmations and the handover."}
+    )
+    state = fields.Str(
+        metadata={
+            "description": "One of `active`, `pending` (death recorded),"
+            " `confirmed` (waiting for the grace period), `executed`."
+        }
+    )
+    death_recorded_at = fields.Str(
+        allow_none=True, metadata={"description": "When the death was noticed."}
+    )
+    confirmed_at = fields.Str(
+        allow_none=True, metadata={"description": "When it was confirmed."}
+    )
+    execute_after = fields.Str(
+        allow_none=True, metadata={"description": "When the handover is due."}
+    )
+    executed_at = fields.Str(
+        allow_none=True, metadata={"description": "When the handover happened."}
+    )
+    executed_successor = fields.Nested(
+        BranchUserSchema,
+        allow_none=True,
+        metadata={"description": "Who took over, once executed."},
+    )
+    vetoed_at = fields.Str(
+        allow_none=True,
+        metadata={"description": "When the user last cancelled the plan."},
+    )
+    successors = fields.List(
+        fields.Nested(BranchUserSchema),
+        metadata={"description": "Successors in order of preference."},
+    )
+    confirmations = fields.List(
+        fields.Nested(SuccessionConfirmationSchema),
+        metadata={"description": "Confirmations given so far."},
+    )
+    eligible_confirmers = fields.List(
+        fields.Nested(BranchUserSchema),
+        metadata={"description": "Users who may confirm."},
+    )
+    is_own = fields.Bool(metadata={"description": "Whether the plan is the caller's."})
+    can_confirm = fields.Bool(
+        metadata={"description": "Whether the caller may confirm the plan now."}
+    )
+
+
+class SuccessionCheckPlanSchema(_Base):
+    """What happened to a plan during a check."""
+
+    id = fields.Int(metadata={"description": "Plan ID."})
+    events = fields.List(
+        fields.Str(),
+        metadata={
+            "description": "Events: `pending`, `reverted`, `confirmed`,"
+            " `executed`, `no_successor`."
+        },
+    )
+
+
+class SuccessionCheckResultSchema(_Base):
+    """Result of a succession check."""
+
+    plans = fields.List(
+        fields.Nested(SuccessionCheckPlanSchema),
+        metadata={"description": "Plans that changed during the check."},
     )
 
 

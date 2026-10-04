@@ -87,7 +87,10 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.security import safe_join
 
 from ..auth import config_get, get_tree, get_tree_usage, set_tree_usage
+from ..auth.branches import get_branch_scope
 from ..auth.const import PERM_VIEW_PRIVATE
+from ..branch_guard import install_branch_guard
+from .succession import install_succession_hook
 from ..const import (
     DB_CONFIG_ALLOWED_KEYS,
     LOCALE_MAP,
@@ -490,6 +493,13 @@ def get_db_outside_request(
         # if we're not authorized to view private records,
         # return a proxy DB instead of the real one
         return ModifiedPrivateProxyDb(dbstate.db)
+    if not readonly:
+        # users administering branches may only write to their branches
+        scope = get_branch_scope(user_id)
+        if scope is not None:
+            install_branch_guard(dbstate.db, scope)
+        # recorded deaths may trigger a succession plan
+        install_succession_hook(dbstate.db, tree)
     return dbstate.db
 
 

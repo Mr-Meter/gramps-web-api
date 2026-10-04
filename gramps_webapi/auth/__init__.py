@@ -161,6 +161,8 @@ def delete_user(name: str) -> None:
     user_db.session.query(OIDCAccount).filter_by(
         user_id=user.id
     ).delete()  # pylint: disable=no-member
+    delete_user_branches(user.id)
+    delete_user_succession(user.id)
 
     user_db.session.delete(user)  # pylint: disable=no-member
     user_db.session.commit()  # pylint: disable=no-member
@@ -249,7 +251,10 @@ def get_pwhash(username: str) -> str:
 
 
 def _get_user_detail(
-    user, include_guid: bool = False, include_oidc_accounts: bool = False
+    user,
+    include_guid: bool = False,
+    include_oidc_accounts: bool = False,
+    branches: Optional[List[str]] = None,
 ):
     details = {
         "name": user.name,
@@ -257,6 +262,8 @@ def _get_user_detail(
         "full_name": user.fullname,
         "role": user.role,
         "tree": user.tree,
+        # looked up here unless the caller fetched them for several users at once
+        "branches": get_user_branches(user.id) if branches is None else branches,
     }
     if include_guid:
         details["user_id"] = user.id
@@ -401,9 +408,13 @@ def get_all_user_details(
     users = _get_users_query(
         tree=tree, all_trees=all_trees, include_treeless=include_treeless
     ).all()
+    branches = get_users_branches(user.id for user in users)
     return [
         _get_user_detail(
-            user, include_guid=include_guid, include_oidc_accounts=include_oidc_accounts
+            user,
+            include_guid=include_guid,
+            include_oidc_accounts=include_oidc_accounts,
+            branches=branches[user.id],
         )
         for user in users
     ]
@@ -437,11 +448,16 @@ def get_user_details_page(
     query = query.order_by(User.name)
     if page is not None:
         query = query.offset((page - 1) * pagesize).limit(pagesize)
+    users = query.all()
+    branches = get_users_branches(user.id for user in users)
     details = [
         _get_user_detail(
-            user, include_guid=include_guid, include_oidc_accounts=include_oidc_accounts
+            user,
+            include_guid=include_guid,
+            include_oidc_accounts=include_oidc_accounts,
+            branches=branches[user.id],
         )
-        for user in query.all()
+        for user in users
     ]
     return details, total_count
 
@@ -839,3 +855,13 @@ class TaskTree(user_db.Model):  # type: ignore
     def __repr__(self):
         """Return string representation of instance."""
         return f"<TaskTree(task_id='{self.task_id}', tree='{self.tree}', name='{self.name}')>"
+
+
+# models of the branch and succession features share this metadata; imported
+# last since they need `user_db` and `User` from above
+from .branches import (  # noqa: E402
+    delete_user_branches,
+    get_user_branches,
+    get_users_branches,
+)
+from .succession import delete_user_succession  # noqa: E402

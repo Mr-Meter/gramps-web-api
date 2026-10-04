@@ -43,6 +43,7 @@ from ...auth import (
     get_user_oidc_accounts,
     modify_user,
 )
+from ...auth.branches import set_user_branches
 from ...auth.oidc_helpers import is_oidc_enabled
 from ...auth.const import (
     CLAIM_LIMITED_SCOPE,
@@ -86,6 +87,7 @@ from ..util import (
     tree_exists,
 )
 from . import LimitedScopeProtectedResource, ProtectedResource, Resource
+from .branches import validate_branch_handles
 from .schemas import UserSchema
 
 
@@ -254,6 +256,25 @@ class UsersResource(ProtectedResource):
                     # a tree could never obtain a token
                     abort_with_message(422, "Tree is required")
                 user_dict["tree"] = tree
+        # branches (e.g. of an imported user list) are not user columns, so
+        # they are kept aside: (name, tree, tag handles) of restricted users
+        branches = []
+        for user_dict in users:
+            handles = user_dict.get("branches")
+            if not handles:
+                continue
+            if not isinstance(handles, list) or not all(
+                isinstance(handle, str) for handle in handles
+            ):
+                abort_with_message(422, "branches must be a list of tag handles")
+            branches.append((user_dict.get("name"), user_dict["tree"] or "", handles))
+        if branches:
+            # restricting someone to branches is a matter of role
+            require_permissions([PERM_EDIT_USER_ROLE])
+            # checked against the user's tree before any user is created, so
+            # that an unknown tag fails the whole batch like the checks above
+            for _name, user_tree, handles in branches:
+                validate_branch_handles(user_tree, handles)
         users = [
             {
                 "name": user_dict.get("name"),
@@ -274,6 +295,8 @@ class UsersResource(ProtectedResource):
             )
         except ValueError as exc:
             abort_with_message(409, str(exc))
+        for name, _tree, handles in branches:
+            set_user_branches(get_guid(name), handles)
         return "", 201
 
 
@@ -300,6 +323,14 @@ class UserPutBodyArgs(Schema):
         required=False,
         metadata={"description": "Tree ID the user belongs to."},
     )
+    branches = fields.List(
+        fields.Str(),
+        required=False,
+        metadata={
+            "description": "Handles of the branch tags to restrict the user's"
+            " write access to; an empty list lifts the restriction."
+        },
+    )
 
 
 class UserPostBodyArgs(Schema):
@@ -324,6 +355,14 @@ class UserPostBodyArgs(Schema):
     tree = fields.Str(
         required=False,
         metadata={"description": "Tree ID the user belongs to."},
+    )
+    branches = fields.List(
+        fields.Str(),
+        required=False,
+        metadata={
+            "description": "Handles of the branch tags to restrict the user's"
+            " write access to."
+        },
     )
 
 
@@ -402,6 +441,19 @@ class UserResource(UserChangeBase):
             require_permissions([PERM_EDIT_USER_TREE])
             if not tree_exists(args["tree"]):
                 abort_with_message(422, "Tree does not exist")
+        if "branches" in args:
+            # restricting someone to branches is a matter of role; checked
+            # after the tree above, so that the tags are looked up in a tree
+            # that exists and that the caller may move the user to
+            if other_tree:
+                require_permissions([PERM_EDIT_OTHER_TREE_USER_ROLE])
+            else:
+                require_permissions([PERM_EDIT_USER_ROLE])
+            user_id = get_guid(user_name)
+            validate_branch_handles(
+                args.get("tree") or get_tree_id_or_none(user_id) or "",
+                args["branches"],
+            )
         if (
             "role" in args
             and args["role"] < ROLE_ADMIN
@@ -437,6 +489,8 @@ class UserResource(UserChangeBase):
             )
         except ValueError as exc:
             abort_with_message(409, str(exc))
+        if "branches" in args:
+            set_user_branches(user_id, args["branches"])
         return "", 200
 
     @api_blueprint.arguments(UserPostBodyArgs, location="json")
@@ -463,6 +517,9 @@ class UserResource(UserChangeBase):
             # only admins may be treeless, since a non-admin without a tree
             # could never obtain a token
             abort_with_message(422, "Tree is required")
+        if args.get("branches"):
+            require_permissions([PERM_EDIT_USER_ROLE])
+            validate_branch_handles(new_tree or "", args["branches"])
         try:
             add_user(
                 name=user_name,
@@ -475,6 +532,8 @@ class UserResource(UserChangeBase):
             )
         except ValueError as exc:
             abort_with_message(409, str(exc))
+        if args.get("branches"):
+            set_user_branches(get_guid(user_name), args["branches"])
         return "", 201
 
     def delete(self, user_name: str):
