@@ -1,0 +1,7 @@
+# Reverse proxy with automatic HTTPS for Gramps Web (compose profile "caddy").
+# SITE_ADDRESS comes from .env, e.g. tree.duckdns.org; without it Caddy
+# serves localhost with a self-signed certificate.
+{$SITE_ADDRESS:localhost} {
+	encode zstd gzip
+	reverse_proxy grampsweb:5000
+}
