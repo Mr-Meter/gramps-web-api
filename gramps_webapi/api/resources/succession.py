@@ -23,7 +23,6 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from flask import jsonify
 from flask_jwt_extended import get_jwt_identity
-from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.errors import HandleError
 from marshmallow import Schema, validate
 from webargs import fields
@@ -56,6 +55,7 @@ from .schemas import (
     SuccessionCheckResultSchema,
     SuccessionPlanSchema,
 )
+from .util import display_name_with_patronymic
 
 
 class SuccessionPlanPostArgs(Schema):
@@ -187,7 +187,7 @@ def _person_summary(db, handle: Optional[str]) -> Optional[Dict[str, str]]:
         return None
     return {
         "gramps_id": person.get_gramps_id(),
-        "name": name_displayer.display(person),
+        "name": display_name_with_patronymic(person),
     }
 
 

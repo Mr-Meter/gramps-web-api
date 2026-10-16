@@ -395,6 +395,9 @@ class PersonProfileSchema(_Base):
     name_surname = fields.Str(
         metadata={"description": "Surname."},
     )
+    name_patronymic = fields.Str(
+        metadata={"description": "Patronymic."},
+    )
     name_suffix = fields.Str(
         metadata={"description": "Name suffix."},
     )
@@ -2733,6 +2736,9 @@ class TimelinePersonProfileSchema(_Base):
     )
     name_surname = fields.Str(
         metadata={"description": "Surname."},
+    )
+    name_patronymic = fields.Str(
+        metadata={"description": "Patronymic."},
     )
     name_suffix = fields.Str(
         metadata={"description": "Name suffix."},

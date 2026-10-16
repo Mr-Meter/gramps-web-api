@@ -41,7 +41,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from flask import current_app
 from gramps.gen.db import DbTxn
 from gramps.gen.db.dbconst import PERSON_KEY, TXNADD, TXNDEL, TXNUPD
-from gramps.gen.display.name import displayer as name_displayer
 from gramps.gen.errors import HandleError
 from gramps.gen.utils.db import get_death_or_fallback
 
@@ -312,13 +311,15 @@ def _display_user(user: Optional[User]) -> str:
 
 
 def _person_name(db, handle: Optional[str]) -> Optional[str]:
+    from .resources.util import display_name_with_patronymic  # avoid an import cycle
+
     if not handle:
         return None
     try:
         person = db.get_person_from_handle(handle)
     except HandleError:
         return None
-    return name_displayer.display(person)
+    return display_name_with_patronymic(person)
 
 
 def _send(subject: str, body: str, recipients: List[str]) -> None:

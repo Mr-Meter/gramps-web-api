@@ -53,6 +53,8 @@ from gramps.gen.lib import (
     EventRoleType,
     Family,
     Media,
+    Name,
+    NameOriginType,
     Person,
     Place,
     PlaceType,
@@ -797,6 +799,47 @@ def get_place_profile_for_handle(
     )
 
 
+def split_patronymic(name: Name) -> tuple[str, str]:
+    """Split a name into its surname and its patronymic.
+
+    A patronymic is stored the way Gramps desktop does it: a non-primary
+    surname with origin type "Patronymic". Returns the remaining surnames
+    formatted like `Name.get_surname` and the patronymic (empty if none).
+    """
+    surnames = []
+    patronymic = ""
+    for surname in name.get_surname_list():
+        if (
+            not patronymic
+            and not surname.get_primary()
+            and surname.get_origintype() == NameOriginType.PATRONYMIC
+        ):
+            patronymic = surname.get_surname().strip()
+        else:
+            surnames.append(surname)
+    if not patronymic:
+        return name.get_surname(), ""
+    rest = Name()
+    rest.set_surname_list(surnames)
+    return rest.get_surname(), patronymic
+
+
+def display_name_with_patronymic(person: Person) -> str:
+    """Return a person's name as "Surname, Given Patronymic Suffix".
+
+    Like the default Gramps name format, but with the patronymic after the
+    given name instead of among the surnames.
+    """
+    name = person.get_primary_name()
+    surname, patronymic = split_patronymic(name)
+    given = " ".join(
+        part
+        for part in [name.get_first_name(), patronymic, name.get_suffix()]
+        if part
+    )
+    return ", ".join(part for part in [surname, given] if part)
+
+
 def get_person_profile_for_object(
     db_handle: DbReadBase,
     person: Person,
@@ -831,6 +874,7 @@ def get_person_profile_for_object(
     name_displayer.set_name_format(db_handle.name_formats)
     fmt_default = config.get("preferences.name-format")
     name_displayer.set_default_format(fmt_default)
+    name_surname, name_patronymic = split_patronymic(person.primary_name)
     profile = {
         "handle": person.handle,
         "gramps_id": person.gramps_id,
@@ -838,7 +882,8 @@ def get_person_profile_for_object(
         "birth": birth,
         "death": death,
         "name_given": name_displayer.display_given(person),
-        "name_surname": person.primary_name.get_surname(),
+        "name_surname": name_surname,
+        "name_patronymic": name_patronymic,
         "name_display": (
             name_displayer.format_str(person.get_primary_name(), name_format)
             if name_format

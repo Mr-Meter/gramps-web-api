@@ -401,6 +401,7 @@ class TestEvents(unittest.TestCase):
                                 "name_display": "Warner, Sarah Suzanne",
                                 "name_given": "Sarah Suzanne",
                                 "name_surname": "Warner",
+                                "name_patronymic": "",
                                 "name_suffix": "",
                                 "sex": "F",
                             },
@@ -425,6 +426,7 @@ class TestEvents(unittest.TestCase):
                             "name_display": "Warner, Sarah Suzanne",
                             "name_given": "Sarah Suzanne",
                             "name_surname": "Warner",
+                            "name_patronymic": "",
                             "name_suffix": "",
                             "sex": "F",
                         }
@@ -696,6 +698,7 @@ class TestEventsHandle(unittest.TestCase):
                                 "name_display": "Knudsen, Ralph",
                                 "name_given": "Ralph",
                                 "name_surname": "Knudsen",
+                                "name_patronymic": "",
                                 "name_suffix": "",
                                 "sex": "M",
                             },
@@ -726,6 +729,7 @@ class TestEventsHandle(unittest.TestCase):
                             "name_display": "Knudsen, Ralph",
                             "name_given": "Ralph",
                             "name_surname": "Knudsen",
+                            "name_patronymic": "",
                             "name_suffix": "",
                             "sex": "M",
                         }
@@ -772,6 +776,7 @@ class TestEventsHandle(unittest.TestCase):
                                 "name_display": "Knudsen, Ralph",
                                 "name_given": "Ralph",
                                 "name_surname": "Knudsen",
+                                "name_patronymic": "",
                                 "name_suffix": "",
                                 "sex": "M",
                             },
@@ -802,6 +807,7 @@ class TestEventsHandle(unittest.TestCase):
                             "name_display": "Knudsen, Ralph",
                             "name_given": "Ralph",
                             "name_surname": "Knudsen",
+                            "name_patronymic": "",
                             "name_suffix": "",
                             "sex": "M",
                         }
@@ -851,6 +857,7 @@ class TestEventsHandle(unittest.TestCase):
                                 "name_display": "Ralph KNUDSEN",
                                 "name_given": "Ralph",
                                 "name_surname": "Knudsen",
+                                "name_patronymic": "",
                                 "name_suffix": "",
                                 "sex": "M",
                             },
@@ -881,6 +888,7 @@ class TestEventsHandle(unittest.TestCase):
                             "name_display": "Ralph KNUDSEN",
                             "name_given": "Ralph",
                             "name_surname": "Knudsen",
+                            "name_patronymic": "",
                             "name_suffix": "",
                             "sex": "M",
                         }

@@ -1184,6 +1184,7 @@ class TestPeopleHandle(unittest.TestCase):
                 "handle": "0PWJQCZYFXOS0HGREE",
                 "name_display": "Warner, Mary Grace Elizabeth",
                 "name_given": "Mary Grace Elizabeth",
+                "name_patronymic": "",
                 "name_suffix": "",
                 "name_surname": "Warner",
                 "sex": "F",
