@@ -50,6 +50,9 @@ x-grampsweb: &grampsweb
     - gramps_db:/root/.gramps/grampsdb     # Gramps database
     - gramps_media:/app/media              # media files
     - gramps_tmp:/tmp
+    # translation models ru_en and en_ru (README.md, "Перевод дерева"); an
+    # empty or missing directory leaves only the transliteration of names
+    - ${TRANSLATION_MODELS_DIR:-../../translation_models}:/app/translation_models:ro
 
 services:
   # site + API; the only service that builds the image

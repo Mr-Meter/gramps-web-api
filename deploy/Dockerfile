@@ -67,10 +67,9 @@ ENV GRAMPS_DATABASE_PATH=/root/.gramps/grampsdb
 # Model is baked into the base image - disable HF Hub network calls at runtime
 ENV HF_HUB_OFFLINE=1
 
-# fork: Russian <-> English translation models for the tree content (~370 MB),
-# fetched before the source is copied so code changes do not download them again
-COPY ${BACKEND_DIR}/gramps_webapi/api/translate/download.py /tmp/download_models.py
-RUN python3 /tmp/download_models.py /app/translation_models && rm /tmp/download_models.py
+# fork: Russian <-> English translation models for the tree content (~370 MB);
+# not in the image: docker-compose.yml mounts them from the host (README.md,
+# "Перевод дерева"), so the build does not depend on their download site
 ENV GRAMPSWEB_CONTENT_TRANSLATION_MODELS=/app/translation_models
 # the cache volume is shared with the celery worker, which does the translating
 ENV GRAMPSWEB_CONTENT_TRANSLATION_DB=/app/cache/translations.sqlite

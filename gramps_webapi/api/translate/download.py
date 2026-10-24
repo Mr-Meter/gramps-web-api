@@ -17,12 +17,14 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 
-"""Download the translation models: python3 download.py <directory>
+"""Install the translation models: python3 download.py <directory>
 
 The Argos Translate packages ru_en and en_ru 1.9 (CTranslate2 format, about
-370 MB together). Only model/ and sentencepiece.model are unpacked; the
-package's sentence splitter is a pickle and not needed. Standard library
-only: the Docker build runs this file before the package is installed.
+370 MB together), checked against their SHA-256. Only model/ and
+sentencepiece.model are unpacked; the package's sentence splitter is a
+pickle and not needed. Standard library only, to run on the host without the
+package installed. TRANSLATION_MODELS_URL may point to a directory with the
+two .argosmodel files downloaded by hand: file:///path/to/dir.
 """
 
 import hashlib
