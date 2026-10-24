@@ -64,9 +64,6 @@ ENV GRAMPSWEB_EXPORT_DIR=/app/cache/export
 ENV GRAMPSHOME=/root
 ENV GRAMPS_DATABASE_PATH=/root/.gramps/grampsdb
 
-# Model is baked into the base image - disable HF Hub network calls at runtime
-ENV HF_HUB_OFFLINE=1
-
 # fork: Russian <-> English translation models for the tree content (~370 MB);
 # not in the image: docker-compose.yml mounts them from the host (README.md,
 # "Перевод дерева"), so the build does not depend on their download site
