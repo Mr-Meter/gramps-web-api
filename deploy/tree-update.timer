@@ -1,0 +1,11 @@
+# Runs tree-update.service every 15 minutes; it only fetches from git unless
+# there is something new to deploy.
+[Unit]
+Description=Check the family tree repositories for updates
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

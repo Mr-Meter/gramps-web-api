@@ -1,0 +1,15 @@
+# Updates the site from git: see update.sh and README.md, "Автообновление".
+# A user unit of the account running rootless Docker (no root needed):
+#   cp tree-update.service tree-update.timer ~/.config/systemd/user/
+[Unit]
+Description=Update the family tree site from git
+
+[Service]
+Type=oneshot
+ExecStart=%h/Tree/gramps-web-api/deploy/update.sh
+# rootless Docker of this user; ~/bin holds its CLI when installed with
+# dockerd-rootless-setuptool.sh
+Environment=DOCKER_HOST=unix://%t/docker.sock
+Environment=PATH=%h/bin:/usr/local/bin:/usr/bin:/bin
+# the first build after many changes can take a while
+TimeoutStartSec=2h
