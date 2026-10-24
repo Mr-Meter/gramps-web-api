@@ -40,7 +40,12 @@ from ..tasks import (
     restore_backup,
     run_task,
 )
-from ..util import abort_with_message, get_db_handle, get_tree_from_jwt
+from ..util import (
+    abort_with_message,
+    get_db_handle,
+    get_tree_from_jwt,
+    remove_file_on_error,
+)
 from ...types import ResponseReturnValue
 from . import FreshProtectedResource, ProtectedResource
 from .emit import GrampsJSONEncoder
@@ -112,18 +117,19 @@ class ImporterFileResource(ProtectedResource):
             abort_with_message(
                 HTTPStatus.NOT_FOUND, f"Importer for extension {extension} not found"
             )
-        file_path = _stream_upload_to_tempfile(extension)
+        file_path = stream_upload_to_tempfile(extension)
         tree = get_tree_from_jwt()
         user_id = get_jwt_identity()
-        task = run_task(
-            import_file,
-            tree=tree,
-            user_id=user_id,
-            file_name=file_path,
-            extension=extension.lower(),
-            delete=True,
-            dry_run=args.get("dry_run", False),
-        )
+        with remove_file_on_error(file_path):
+            task = run_task(
+                import_file,
+                tree=tree,
+                user_id=user_id,
+                file_name=file_path,
+                extension=extension.lower(),
+                delete=True,
+                dry_run=args.get("dry_run", False),
+            )
         if isinstance(task, AsyncResult):
             return make_task_response(task)
         if args.get("dry_run", False):
@@ -133,7 +139,7 @@ class ImporterFileResource(ProtectedResource):
         return task, 201
 
 
-def _stream_upload_to_tempfile(extension: str) -> str:
+def stream_upload_to_tempfile(extension: str) -> str:
     """Stream the request body to a temporary file and return its path.
 
     Aborts with 400, removing the file, if the body is empty or its size does
@@ -202,17 +208,18 @@ class RestoreFileResource(FreshProtectedResource):
             abort_with_message(
                 HTTPStatus.NOT_FOUND, f"Importer for extension {extension} not found"
             )
-        file_path = _stream_upload_to_tempfile(extension)
+        file_path = stream_upload_to_tempfile(extension)
         tree = get_tree_from_jwt()
         user_id = get_jwt_identity()
-        task = run_task(
-            restore_backup,
-            tree=tree,
-            user_id=user_id,
-            file_name=file_path,
-            extension=extension.lower(),
-            dry_run=args.get("dry_run", False),
-        )
+        with remove_file_on_error(file_path):
+            task = run_task(
+                restore_backup,
+                tree=tree,
+                user_id=user_id,
+                file_name=file_path,
+                extension=extension.lower(),
+                dry_run=args.get("dry_run", False),
+            )
         if isinstance(task, AsyncResult):
             return make_task_response(task)
         return jsonify(task), 200

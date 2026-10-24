@@ -28,27 +28,33 @@ from typing import Any
 
 import gramps_ql as gql
 import limits
-import sifts
 from flask import Response, current_app
+from flask_jwt_extended import get_jwt_identity
 from gramps.gen.const import ENV, GRAMPS_LOCALE
 from gramps.gen.db.base import DbReadBase
 from gramps.gen.db.generic import DbGeneric
 from gramps.gen.db.utils import get_dbid_from_path
 from gramps.gen.utils.grampslocale import INCOMPLETE_TRANSLATIONS
-from marshmallow import Schema, RAISE
+from marshmallow import RAISE, Schema
 from webargs import fields
 
 from gramps_webapi.const import TREE_MULTI, VERSION
 
+from ...auth import config_get_all
 from ...auth.const import PERM_EDIT_TREE, PERM_VIEW_PRIVATE, PERM_VIEW_SETTINGS
 from ...dbmanager import WebDbManager
 from ..auth import has_permissions, require_permissions
+from ..backup_store import backups_enabled
 from ..blueprint import api_blueprint
 from ..deprecations import check_deprecations
-from ..search import get_search_indexer, get_semantic_search_indexer
-from ..search import _get_search_index_db_url
-from ..search.metadata import get_stored_model_name
-from ..util import get_config, get_db_handle, get_tree_from_jwt_or_fail
+from ..search import get_search_indexer
+from ..tasks import queue_search_index_build
+from ..util import (
+    get_config,
+    get_db_handle,
+    get_tree_from_jwt,
+    get_tree_from_jwt_or_fail,
+)
 from . import ProtectedResource
 from .emit import GrampsJSONEncoder
 from .schemas import MetadataSchema, MetadataServerSchema, ResearcherSchema
@@ -80,7 +86,7 @@ def _has_module(name: str) -> bool:
 @functools.cache
 def _get_face_detection_available() -> bool:
     """Detect whether face detection is available (worker-lifetime constant)."""
-    # see `gramps_webapi.api.image.detect_faces`
+    # see `gramps_webapi.api.faces.detect_faces`
     return _has_module("cv2") and _has_module("numpy")
 
 
@@ -164,6 +170,16 @@ def _get_dbid_from_tree_id(tree_id: str) -> str:
     return get_dbid_from_tree_id(tree_id)
 
 
+def _get_single_tree_backend(is_multi_tree: bool) -> str | None:
+    """Return the DB backend ID of the tree in single-tree mode, else None."""
+    if is_multi_tree:
+        return None
+    tree_id = get_tree_from_jwt()
+    if not tree_id:
+        return None
+    return _get_dbid_from_tree_id(tree_id)
+
+
 def _get_server_metadata() -> dict[str, Any]:
     """Return the metadata sections that do not depend on a tree.
 
@@ -171,7 +187,6 @@ def _get_server_metadata() -> dict[str, Any]:
     shape in both.
     """
     is_multi_tree = current_app.config["TREE"] == TREE_MULTI
-    has_semantic_search = bool(current_app.config["VECTOR_EMBEDDING_MODEL"])
     has_ocr, ocr_languages = _get_ocr_info()
     result: dict[str, Any] = {
         "gramps": {
@@ -199,14 +214,16 @@ def _get_server_metadata() -> dict[str, Any]:
             "task_queue": bool(current_app.config["CELERY_CONFIG"]),
             "ocr": has_ocr,
             "ocr_languages": ocr_languages,
-            "semantic_search": has_semantic_search,
-            "chat": has_semantic_search and bool(current_app.config["LLM_MODEL"]),
+            # semantic search was removed in 3.25.0; kept for older clients
+            "semantic_search": False,
+            "chat": bool(current_app.config["LLM_MODEL"]),
             "face_detection": _get_face_detection_available(),
             "thumbnails": _get_thumbnail_support(),
             # may be stored in the database, so it is looked up rather than
             # read from the app config
             "email": bool(get_config("DEFAULT_FROM_EMAIL")),
             "max_thumbnail_file_bytes": current_app.config["MAX_THUMBNAIL_FILE_BYTES"],
+            "backups": backups_enabled(),
         },
     }
     max_upload_bytes = current_app.config["MAX_MEDIA_ARCHIVE_UPLOAD_BYTES"]
@@ -217,6 +234,11 @@ def _get_server_metadata() -> dict[str, Any]:
     if rate_limit is not None:
         # omitted if the configured limit string is unparseable
         result["server"]["rate_limit_media_archive"] = rate_limit
+    if backups_enabled():
+        result["server"]["backup_keep"] = current_app.config["BACKUP_KEEP"]
+        rate_limit = _parse_rate_limit(current_app.config["RATE_LIMIT_BACKUP"])
+        if rate_limit is not None:
+            result["server"]["rate_limit_backup"] = rate_limit
     if has_permissions({PERM_VIEW_SETTINGS}) or (
         # in a single-tree deployment the owner is the server operator and can
         # act on the deprecations, while in multi-tree they are a tenant who
@@ -226,7 +248,15 @@ def _get_server_metadata() -> dict[str, Any]:
     ):
         # re-checked per request since some options can be stored in the database
         result["deprecations"] = check_deprecations(
-            current_app.config, get_option=get_config
+            current_app.config,
+            get_option=get_config,
+            # once the app config has the same value, nothing changes in 4.0
+            db_options=[
+                key
+                for key, value in config_get_all().items()
+                if value is not None and value != str(current_app.config.get(key))
+            ],
+            tree_backend=_get_single_tree_backend(is_multi_tree),
         )
     return result
 
@@ -259,32 +289,16 @@ class MetadataResource(ProtectedResource, GrampsJSONEncoder):
         tree_id = get_tree_from_jwt_or_fail()
         db_type = _get_dbid_from_tree_id(tree_id)
         searcher = get_search_indexer(tree_id)
+        building = queue_search_index_build(tree_id, user_id=get_jwt_identity())
         search_count = searcher.count(
             include_private=has_permissions({PERM_VIEW_PRIVATE})
         )
+        # kept under the name of the former search library: the frontend
+        # reads the count to tell whether the index needs to be rebuilt
         sifts_info = {
-            "version": sifts.__version__,
+            "version": VERSION,
             "count": search_count,
         }
-        if current_app.config.get("VECTOR_EMBEDDING_MODEL"):
-            configured_model = current_app.config["VECTOR_EMBEDDING_MODEL"]
-            try:
-                db_url = _get_search_index_db_url()
-                stored_model = get_stored_model_name(db_url, tree_id)
-                stale = stored_model is not None and stored_model != configured_model
-            except (ValueError, OSError):
-                stale = False
-            sifts_info["semantic_index_stale"] = stale
-            if not stale:
-                try:
-                    searcher_s = get_semantic_search_indexer(tree_id)
-                    sifts_info["count_semantic"] = searcher_s.count(
-                        include_private=has_permissions({PERM_VIEW_PRIVATE})
-                    )
-                except ValueError:
-                    sifts_info["count_semantic"] = None
-            else:
-                sifts_info["count_semantic"] = None
 
         result = {
             **_get_server_metadata(),
@@ -309,20 +323,18 @@ class MetadataResource(ProtectedResource, GrampsJSONEncoder):
             "researcher": db_handle.get_researcher(),
             "search": {
                 "sifts": sifts_info,
+                "building": building,
             },
         }
         if args["surnames"]:
             result["surnames"] = db_handle.get_surname_list()
         data = db_handle.get_summary()
-        db_version_key = GRAMPS_LOCALE.translation.sgettext("Database version")
-        db_module_key = GRAMPS_LOCALE.translation.sgettext("Database module version")
-        db_schema_key = GRAMPS_LOCALE.translation.sgettext("Schema version")
         for item in data:
-            if item == db_version_key:
+            if item == "Database version":
                 result["database"]["version"] = data[item]
-            elif item == db_module_key:
+            elif item == "Database module version":
                 result["database"]["module"] = data[item]
-            elif item == db_schema_key:
+            elif item == "Schema version":
                 result["database"]["schema"] = data[item]
         if isinstance(db_handle, DbGeneric):
             result["database"]["actual_schema"] = db_handle.get_schema_version()

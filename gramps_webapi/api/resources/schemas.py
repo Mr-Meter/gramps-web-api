@@ -13,7 +13,11 @@ Dependency order (leaf → root) is maintained so that forward-reference lambdas
 are needed only for genuinely circular pairs.
 """
 
-from marshmallow import INCLUDE, Schema, fields, validate
+import base64
+import binascii
+from urllib.parse import urlsplit
+
+from marshmallow import INCLUDE, Schema, ValidationError, fields, validate
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,6 +29,55 @@ class _Base(Schema):
 
     class Meta:
         unknown = INCLUDE
+
+
+def validate_push_endpoint(value: str) -> str:
+    """Validate a browser-provided push endpoint without contacting it."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValidationError("Invalid Web Push endpoint") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValidationError("Invalid Web Push endpoint")
+    hostname = parsed.hostname.casefold()
+    if hostname != "fcm.googleapis.com" and not any(
+        hostname.endswith(suffix)
+        for suffix in (
+            ".push.services.mozilla.com",
+            ".push.apple.com",
+            ".notify.windows.com",
+        )
+    ):
+        raise ValidationError("Invalid Web Push endpoint")
+    return value
+
+
+def push_key_validator(expected_bytes: int, prefix: bytes | None = None):
+    """Return a validator for a URL-safe base64 Web Push key."""
+
+    def validate_key(value: str) -> str:
+        try:
+            padding = "=" * (-len(value) % 4)
+            decoded = base64.b64decode(
+                value + padding,
+                altchars=b"-_",
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as exc:
+            raise ValidationError("Invalid Web Push key") from exc
+        if len(decoded) != expected_bytes or (
+            prefix is not None and not decoded.startswith(prefix)
+        ):
+            raise ValidationError("Invalid Web Push key")
+        return value
+
+    return validate_key
 
 
 # ===========================================================================
@@ -1787,6 +1840,57 @@ class PersonExtendedSchema(_Base):
 # ===========================================================================
 
 
+class PushSubscriptionKeysSchema(Schema):
+    """Encryption keys from ``PushSubscription.toJSON()``."""
+
+    p256dh = fields.Str(
+        required=True,
+        validate=push_key_validator(65, b"\x04"),
+        metadata={"description": "P-256 ECDH public key for payload encryption."},
+    )
+    auth = fields.Str(
+        required=True,
+        validate=push_key_validator(16),
+        metadata={"description": "Authentication secret for payload encryption."},
+    )
+
+
+class PushSubscriptionBodySchema(Schema):
+    """Browser Web Push subscription payload."""
+
+    endpoint = fields.Str(
+        required=True,
+        validate=[validate.Length(min=1, max=4096), validate_push_endpoint],
+        metadata={"description": "HTTPS endpoint assigned by the push service."},
+    )
+    keys = fields.Nested(
+        PushSubscriptionKeysSchema,
+        required=True,
+        metadata={"description": "Encryption keys assigned to this subscription."},
+    )
+
+
+class PushSubscriptionDeleteSchema(Schema):
+    """Payload identifying the current browser subscription to delete."""
+
+    endpoint = fields.Str(
+        required=True,
+        metadata={"description": "Endpoint of the subscription to delete."},
+    )
+
+
+class PushSubscriptionConfigSchema(Schema):
+    """Public Web Push configuration for the current client."""
+
+    public_key = fields.Str(
+        required=True,
+        allow_none=True,
+        metadata={
+            "description": "VAPID public key, or null when Web Push is not configured."
+        },
+    )
+
+
 class JWTAccessTokensSchema(_Base):
     """Response containing both an access token and a refresh token."""
 
@@ -1859,6 +1963,46 @@ class OIDCTokenExchangeSchema(_Base):
             "description": "Single-use code from the fragment of the OIDC login"
             " redirect."
         },
+    )
+
+
+class OIDCLinkSchema(_Base):
+    """Body of a POST to /oidc/link/."""
+
+    provider = fields.Str(
+        required=True,
+        metadata={"description": "ID of the OIDC provider to link, e.g. 'custom'."},
+    )
+
+
+class OIDCLinkTicketSchema(_Base):
+    """Ticket returned by /oidc/link/."""
+
+    ticket = fields.Str(
+        metadata={
+            "description": "Short-lived, single-use ticket to pass as `link` to"
+            " /oidc/login/."
+        },
+    )
+
+
+class OIDCLinkCompleteSchema(_Base):
+    """Body of a POST to /oidc/link/complete/."""
+
+    code = fields.Str(
+        required=True,
+        metadata={
+            "description": "Single-use `link_code` from the fragment of the"
+            " redirect after linking at the provider."
+        },
+    )
+
+
+class OIDCLinkedSchema(_Base):
+    """Result of a completed link."""
+
+    provider = fields.Str(
+        metadata={"description": "ID of the OIDC provider that was linked."},
     )
 
 
@@ -2004,7 +2148,9 @@ class FilterRuleParamOptionSchema(_Base):
         metadata={"description": "Value to pass in the rule's values."},
     )
     label = fields.Str(
-        metadata={"description": "Untranslated display label of the value."},
+        metadata={
+            "description": "Display label of the value, in the requested locale."
+        },
     )
 
 
@@ -2049,6 +2195,13 @@ class FilterRuleParamTypeSchema(_Base):
     options = fields.List(
         fields.Nested(FilterRuleParamOptionSchema),
         metadata={"description": "Allowed values for type 'select'."},
+    )
+    custom = fields.Bool(
+        metadata={
+            "description": "True if the rule defines its own input for this "
+            "parameter in the Gramps filter editor and the format of its value "
+            "is unknown. Absent otherwise."
+        },
     )
     default_types = fields.Str(
         metadata={
@@ -2231,6 +2384,18 @@ class ImportResultSchema(ObjectCountsSchema):
             )
         },
     )
+    index_tasks = fields.List(
+        fields.Nested(lambda: TaskReferenceSchema()),
+        metadata={
+            "description": (
+                "Background tasks updating the search indices after the import. "
+                "The import is complete when this result is returned; search "
+                "results may be incomplete until these tasks have finished. "
+                "Empty when the server runs without a task queue, in which case "
+                "the indices were already updated. Absent for a dry run."
+            )
+        },
+    )
 
 
 class ExportResultSchema(_Base):
@@ -2342,7 +2507,9 @@ class ServerSchema(_Base):
         metadata={"description": "Language codes available for OCR."},
     )
     semantic_search = fields.Bool(
-        metadata={"description": "Whether semantic search is available."},
+        metadata={
+            "description": "Always false: semantic search was removed in version 3.25.0."
+        },
     )
     chat = fields.Bool(
         metadata={"description": "Whether the AI chat endpoint is available."},
@@ -2382,11 +2549,32 @@ class ServerSchema(_Base):
             " thumbnail endpoints."
         },
     )
+    backups = fields.Boolean(
+        metadata={
+            "description": "Whether a backup directory is configured. If false,"
+            " backups can't be created or stored, only restored from an upload."
+        },
+    )
     rate_limit_media_archive = fields.List(
         fields.Nested(RateLimitSchema),
         metadata={
             "description": "Rate limits, per user, for creating a media archive for"
             " download. All of the limits apply simultaneously."
+        },
+    )
+    backup_keep = fields.Int(
+        metadata={
+            "description": "Number of stored backups kept per tree. Creating a"
+            " backup deletes the oldest ones beyond this number. Absent if"
+            " backups are not configured."
+        },
+    )
+    rate_limit_backup = fields.List(
+        fields.Nested(RateLimitSchema),
+        metadata={
+            "description": "Rate limits, per tree, for creating a backup. All of"
+            " the limits apply simultaneously. Absent if backups are not"
+            " configured."
         },
     )
 
@@ -2611,6 +2799,123 @@ class RestoreSummarySchema(_Base):
             )
         },
     )
+    index_tasks = fields.List(
+        fields.Nested(lambda: TaskReferenceSchema()),
+        metadata={
+            "description": (
+                "Background tasks updating the search indices after the restore. "
+                "The restore is complete when this result is returned; search "
+                "results may be incomplete until these tasks have finished. "
+                "Empty when the server runs without a task queue, in which case "
+                "the indices were already updated. Absent for a dry run."
+            )
+        },
+    )
+
+
+class BackupSchema(_Base):
+    """A stored backup archive."""
+
+    id = fields.Str(metadata={"description": "ID of the backup."})
+    size = fields.Integer(metadata={"description": "Size of the archive in bytes."})
+    restorable = fields.Boolean(
+        metadata={
+            "description": (
+                "Whether this server can restore the backup. False e.g. for a"
+                " backup made with a newer database schema, after a downgrade."
+            )
+        },
+    )
+    manifest = fields.Dict(
+        metadata={
+            "description": (
+                "The backup's manifest: when and from which tree it was made, "
+                "the versions, object counts and number of media files."
+            )
+        },
+    )
+
+
+class TreeSettingsRestoreSchema(_Base):
+    """Result of restoring the tree settings from a backup."""
+
+    changed = fields.Boolean(
+        metadata={
+            "description": "Whether the backup's tree settings differ from the current ones."
+        },
+    )
+
+
+class UsersRestoreSchema(_Base):
+    """Result of restoring the users from a backup."""
+
+    added = fields.List(
+        fields.Str(),
+        metadata={
+            "description": (
+                "Names of the users added to the tree, with a random password "
+                "and a role of at most owner. They log in after resetting "
+                "their password."
+            )
+        },
+    )
+    skipped = fields.List(
+        fields.Str(),
+        metadata={
+            "description": (
+                "Names of the users not added because a user with that name "
+                "already exists on the server, in any tree. Existing users are "
+                "never changed."
+            )
+        },
+    )
+
+
+class BackupRestoreResultSchema(_Base):
+    """Result of restoring a tree from a backup archive."""
+
+    manifest = fields.Dict(
+        metadata={
+            "description": (
+                "The backup's manifest: when and from which tree it was made, "
+                "the versions, object counts and media totals."
+            )
+        },
+    )
+    data = fields.Nested(
+        RestoreSummarySchema,
+        metadata={
+            "description": "Changeset of the family tree data. Absent if not selected."
+        },
+    )
+    missing_media = fields.List(
+        fields.Str(),
+        metadata={
+            "description": (
+                "Gramps IDs of the backup's media objects whose files don't "
+                "exist on the server. Media files are not part of the backup. "
+                "Absent if the data was not selected."
+            )
+        },
+    )
+    tree_settings = fields.Nested(
+        TreeSettingsRestoreSchema,
+        metadata={"description": "Absent if not selected."},
+    )
+    users = fields.Nested(
+        UsersRestoreSchema,
+        metadata={"description": "Absent if not selected."},
+    )
+    index_tasks = fields.List(
+        fields.Nested(lambda: TaskReferenceSchema()),
+        metadata={
+            "description": (
+                "Background tasks updating the search indices after the data "
+                "was restored, see the restore endpoint. Absent for a dry run "
+                "or if the data was not selected."
+            )
+        },
+    )
 
 
 class ReportHelpOptionSchema(_Base):
@@ -2659,7 +2964,7 @@ class ReportSchema(_Base):
 
 
 class SearchResultSchema(_Base):
-    """A single result from a full-text or semantic search."""
+    """A single result from a full-text search."""
 
     handle = fields.Str(
         metadata={"description": "Handle of the matching object."},
@@ -2851,7 +3156,7 @@ class DnaMatchSchema(_Base):
         metadata={"description": "Handles of latest common ancestors."},
     )
     ancestor_profiles = fields.List(
-        fields.List(fields.Nested(PersonProfileSchema)),
+        fields.Nested(PersonProfileSchema),
         metadata={"description": "Profiles of latest common ancestors."},
     )
     segments = fields.List(
@@ -3034,6 +3339,9 @@ class TreeConfigSchema(_Base):
 class UserOIDCAccountSchema(_Base):
     """An OIDC account linked to a user."""
 
+    id = fields.Int(
+        metadata={"description": "ID of the link, used to unlink the account."},
+    )
     provider_id = fields.Str(
         metadata={"description": "ID of the OIDC provider."},
     )
@@ -3046,6 +3354,18 @@ class UserOIDCAccountSchema(_Base):
     )
     created_at = fields.DateTime(
         metadata={"description": "Date and time the account was linked."},
+    )
+
+
+class UserOIDCUnlinkSchema(_Base):
+    """Request body for unlinking one's own OIDC account."""
+
+    password = fields.Str(
+        load_default=None,
+        metadata={
+            "description": "The user's current password. Required to unlink their"
+            " last OIDC account."
+        },
     )
 
 

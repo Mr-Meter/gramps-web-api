@@ -20,14 +20,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from gettext import gettext as _
 from http import HTTPStatus
 from typing import Any, Callable, Dict, List, Optional, Union
 
-import logging
 import sqlalchemy as sa
 from celery import Task, shared_task
 from celery.result import AsyncResult
@@ -39,19 +40,45 @@ from gramps.gen.lib.json_utils import object_to_dict
 from gramps.gen.merge.diff import diff_items
 from werkzeug.exceptions import HTTPException
 
-from gramps_webapi.api.search.indexer import SearchIndexer, SemanticSearchIndexer
+from gramps_webapi.api.search.indexer import SearchIndexer
 
-from ..auth import TaskTree, get_owner_emails
-from ..auth import user_db
+from ..auth import TaskTree, get_owner_emails, user_db
 from ..branch_guard import BranchPermissionError
 from .succession import evaluate_all_trees, evaluate_tree
 from .translate.machine import translate_missing
 from ..undodb import migrate as migrate_undodb
+from ..util.task_state import (
+    LOCK_BACKUP,
+    LOCK_MEDIA_USAGE,
+    LOCK_SEARCH_INDEX,
+    LOCK_SEARCH_INDEX_INCREMENTAL,
+    LOCK_WRITE,
+    TaskLocked,
+    acquire,
+    mark_failed,
+    progress_reporter,
+    run_tracked,
+)
+from ..verify_lib import run_verify
+from .backup import (
+    extract_data,
+    find_missing_media,
+    read_backup,
+    restore_tree_config,
+    restore_users,
+    write_backup,
+)
+from .backup_store import get_backup_store
 from .check import check_database
 from .emails import email_confirm_email, email_new_user, email_reset_pw
-from ..verify_lib import run_verify
 from .export import prepare_options, run_export
-from .media import get_media_handler
+from .media import (
+    MediaHandlerS3,
+    delete_expired_local_archives,
+    get_local_archive_dir,
+    get_media_handler,
+    update_usage_media,
+)
 from .media_importer import MediaImporter
 from .report import run_report
 from .resources.delete import delete_all_objects
@@ -68,11 +95,7 @@ from .resources.util import (
     run_import,
     transaction_to_json,
 )
-from .search import (
-    get_current_semantic_search_indexer,
-    get_search_indexer,
-    get_semantic_search_indexer,
-)
+from .search import get_search_indexer
 from .telemetry import (
     get_telemetry_payload,
     send_telemetry,
@@ -80,9 +103,11 @@ from .telemetry import (
     update_telemetry_timestamp,
 )
 from .util import (
+    UserTaskProgress,
     check_quota_people,
     close_db,
     get_config,
+    get_db_manager,
     get_db_outside_request,
     get_locale_for_language,
     gramps_object_from_dict,
@@ -90,19 +115,6 @@ from .util import (
     update_usage_people,
     upgrade_gramps_database,
 )
-
-
-def _record_task(task_id: str, task: Task, kwargs: dict) -> None:
-    """Write one audit row to task_tree before the task is dispatched."""
-    row = TaskTree(
-        task_id=task_id,
-        tree=kwargs.get("tree"),
-        user_id=kwargs.get("user_id"),
-        name=task.name,
-        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
-    )
-    user_db.session.add(row)
-    user_db.session.commit()
 
 
 def get_task_result_cutoff() -> datetime:
@@ -118,43 +130,101 @@ def get_task_result_cutoff() -> datetime:
 
 
 def _purge_expired_task_rows() -> None:
-    """Delete task_tree rows older than the Celery result TTL."""
+    """Delete task_tree rows older than the Celery result TTL.
+
+    Rows still holding a lock are kept: they are released by the reaper.
+    """
     cutoff = get_task_result_cutoff()
-    user_db.session.query(TaskTree).filter(TaskTree.created_at < cutoff).delete(
-        synchronize_session=False
-    )
+    user_db.session.query(TaskTree).filter(
+        TaskTree.created_at < cutoff, TaskTree.lock_key.is_(None)
+    ).delete(synchronize_session=False)
     user_db.session.commit()
 
 
+def _acquire(
+    task_id: str, task: Task, lock_key: str | None, kwargs: dict
+) -> str | None:
+    """Record the task, aborting with 409 if its lock is held by another task.
+
+    Returns the ID of the active task a coalesced dispatch was folded into.
+    """
+    tree = kwargs.get("tree")
+    try:
+        _purge_expired_task_rows()
+        return acquire(task_id, task.name, tree, kwargs.get("user_id"), lock_key)
+    except TaskLocked as exc:
+        abort_with_message(
+            HTTPStatus.CONFLICT,
+            "Another task is already running on this tree",
+            error_type="task_locked",
+            extra={"task": task_reference(AsyncResult(exc.holder_id))},
+        )
+    except sa.exc.SQLAlchemyError:
+        user_db.session.rollback()
+        if lock_key is not None:
+            # without its row, the lock can't be enforced
+            logging.getLogger(__name__).error(
+                "Could not acquire lock %s on tree %s", lock_key, tree, exc_info=True
+            )
+            abort_with_message(
+                HTTPStatus.SERVICE_UNAVAILABLE, "Task tracking is unavailable"
+            )
+        logging.getLogger(__name__).warning(
+            "task_tree DB operation failed for task %s; dispatching anyway",
+            task_id,
+            exc_info=True,
+        )
+        return None
+
+
 def run_task(task: Task, **kwargs) -> Union[AsyncResult, Any]:
-    """Send a task to the task queue or run immediately if no queue set up."""
+    """Send a task to the task queue or run immediately if no queue set up.
+
+    A task declared with a ``lock_key`` is exclusive per tree and key (see
+    util/task_state.py): a second dispatch aborts with 409 or, for a
+    coalescing key, is folded into the active task. The result then refers to
+    the active task, or is None when running without a queue. Dry runs don't
+    change the tree, so they never lock.
+    """
+    lock_key = None if kwargs.get("dry_run") else getattr(task, "lock_key", None)
     if not current_app.config["CELERY_CONFIG"]:
+        task_id = None
+        if lock_key is not None:
+            task_id = str(uuid.uuid4())
+            if _acquire(task_id, task, lock_key, kwargs) is not None:
+                return None
         with current_app.app_context():
             try:
-                return task(**kwargs)
+                return run_tracked(task_id, lambda: task(**kwargs))
             except (HTTPException, BranchPermissionError):
                 # the task aborted with an API error - preserve status & message
                 raise
             except Exception as exc:
                 abort_with_message(500, str(exc))
     task_id = str(uuid.uuid4())
+    holder_id = _acquire(task_id, task, lock_key, kwargs)
+    if holder_id is not None:
+        return AsyncResult(holder_id)
     try:
-        _purge_expired_task_rows()
-        _record_task(task_id, task, kwargs)
-    except sa.exc.SQLAlchemyError:
-        user_db.session.rollback()
-        logging.getLogger(__name__).warning(
-            "task_tree DB operation failed for task %s; dispatching anyway",
-            task_id,
-            exc_info=True,
-        )
-    return task.apply_async(kwargs=kwargs, task_id=task_id)
+        return task.apply_async(kwargs=kwargs, task_id=task_id)
+    except Exception as exc:
+        try:
+            mark_failed(task_id, str(exc))
+        except sa.exc.SQLAlchemyError:
+            logging.getLogger(__name__).warning(
+                "Failed to mark task %s as failed", task_id, exc_info=True
+            )
+        raise
+
+
+def task_reference(task: AsyncResult) -> dict[str, str]:
+    """Return the location of the task status endpoint and the task ID."""
+    return {"href": f"/api/tasks/{task.id}", "id": task.id}
 
 
 def make_task_response(task: AsyncResult):
     """Make a 202 response with the location of the task status endpoint."""
-    url = f"/api/tasks/{task.id}"
-    payload = {"task": {"href": url, "id": task.id}}
+    payload = {"task": task_reference(task)}
     response = jsonify(payload)
     response.status_code = HTTPStatus.ACCEPTED
     return response
@@ -219,15 +289,10 @@ def send_email_new_user(
 
 
 def _search_reindex_full(
-    tree: str, user_id: str, semantic: bool, progress_cb: Optional[Callable] = None
+    tree: str, user_id: str, progress_cb: Optional[Callable] = None
 ) -> None:
     """Rebuild the search index."""
-    if semantic:
-        indexer: SearchIndexer | SemanticSearchIndexer = get_semantic_search_indexer(
-            tree, skip_model_check=True
-        )
-    else:
-        indexer = get_search_indexer(tree)
+    indexer = get_search_indexer(tree)
     db = get_db_outside_request(
         tree=tree, view_private=True, readonly=True, user_id=user_id
     )
@@ -237,8 +302,8 @@ def _search_reindex_full(
         close_db(db)
 
 
-def progress_callback_count(self, title: str = "", message: str = "") -> Callable:
-    """Build a progress callback that reports via Celery's `update_state()`.
+def progress_callback_count(title: str = "", message: str = "") -> Callable:
+    """Build a progress callback that stores progress in the task's row.
 
     Throttled to (at most) one report per integer percentage point, the
     same way `__main__.py`'s CLI `progress_callback_count_factory` throttles
@@ -247,15 +312,15 @@ def progress_callback_count(self, title: str = "", message: str = "") -> Callabl
     That makes the throttle self-contained -- a producer that calls back
     once per object with no `prev` (most of them: check.py, media.py,
     media_importer.py, delete.py, restore.py, and reindex_incremental's own
-    per-object loop) still collapses to ~100 `update_state()` calls
-    regardless of tree size, each one a JSON-encode plus a Redis round
-    trip. A producer that *does* pass real `prev` values (reindex_full,
+    per-object loop) still collapses to ~100 database writes regardless of
+    tree size. A producer that *does* pass real `prev` values (reindex_full,
     batched by chunk_size) throttles the same way, just computed from its
     own strides instead of single-object steps.
     """
+    report = progress_reporter()
 
     def callback(current: int, total: int, prev: int | None = None) -> None:
-        if total == 0 or self.request.id is None:
+        if total == 0:
             return
         pct = int(100 * current / total)
         if prev is None:
@@ -263,82 +328,43 @@ def progress_callback_count(self, title: str = "", message: str = "") -> Callabl
         pct_prev = int(100 * prev / total)
         if current != 0 and pct == pct_prev:
             return
-        self.update_state(
-            state="PROGRESS",
-            meta={
+        report(
+            {
                 "current": current,
                 "total": total,
                 "progress": clip_progress(current / total),
                 "title": title,
                 "message": message,
-            },
+            }
         )
 
     return callback
 
 
-def set_progress_title(self, title: str = "", message: str = "") -> None:
+def set_progress_title(title: str = "", message: str = "") -> None:
     """Set a title/message indicating progress."""
-    if self.request.id is not None:
-        self.update_state(
-            state="PROGRESS",
-            meta={
-                "title": title,
-                "message": message,
-            },
-        )
+    progress_reporter()({"title": title, "message": message})
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_SEARCH_INDEX)
 def search_reindex_full(self, tree: str, user_id: str, semantic: bool = False) -> None:
-    """Rebuild the full-text search index (or the semantic index if ``semantic=True``).
+    """Rebuild the full-text search index.
 
-    The ``semantic`` parameter is accepted for backward compatibility with
-    jobs that were enqueued before this task was split into separate
-    full-text / semantic variants.  New callers should use
-    ``search_reindex_full_semantic`` for semantic reindexing.
+    The ``semantic`` parameter is ignored; it is accepted so that jobs
+    enqueued before semantic search was removed still run.
     """
     return _search_reindex_full(
         tree=tree,
         user_id=user_id,
-        semantic=semantic,
-        progress_cb=progress_callback_count(self, title="Updating search index..."),
-    )
-
-
-@shared_task(bind=True)
-def search_reindex_full_semantic(self, tree: str, user_id: str) -> None:
-    """Rebuild the semantic search index."""
-    return _search_reindex_full(
-        tree=tree,
-        user_id=user_id,
-        semantic=True,
-        progress_cb=progress_callback_count(
-            self, title="Updating semantic search index..."
-        ),
+        progress_cb=progress_callback_count(title="Updating search index..."),
     )
 
 
 def _search_reindex_incremental(
-    tree: str, user_id: str, semantic: bool, progress_cb: Optional[Callable] = None
+    tree: str, user_id: str, progress_cb: Optional[Callable] = None
 ) -> None:
     """Run an incremental reindex of the search index."""
-    if semantic:
-        indexer: SearchIndexer | SemanticSearchIndexer = get_semantic_search_indexer(
-            tree
-        )
-    else:
-        indexer = get_search_indexer(tree)
-    _reindex_incremental(indexer, tree=tree, user_id=user_id, progress_cb=progress_cb)
-
-
-def _reindex_incremental(
-    indexer: SearchIndexer | SemanticSearchIndexer,
-    tree: str,
-    user_id: str,
-    progress_cb: Optional[Callable] = None,
-) -> None:
-    """Run an incremental reindex with the given indexer."""
+    indexer = get_search_indexer(tree)
     db = get_db_outside_request(
         tree=tree, view_private=True, readonly=True, user_id=user_id
     )
@@ -348,39 +374,69 @@ def _reindex_incremental(
         close_db(db)
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_SEARCH_INDEX_INCREMENTAL)
 def search_reindex_incremental(
     self, tree: str, user_id: str, semantic: bool = False
 ) -> None:
-    """Run an incremental reindex of the full-text search index (or the semantic index if ``semantic=True``).
+    """Run an incremental reindex of the full-text search index.
 
-    The ``semantic`` parameter is accepted for backward compatibility with
-    jobs that were enqueued before this task was split into separate
-    full-text / semantic variants.  New callers should use
-    ``search_reindex_incremental_semantic`` for semantic reindexing.
+    The ``semantic`` parameter is ignored; it is accepted so that jobs
+    enqueued before semantic search was removed still run.
     """
     return _search_reindex_incremental(
         tree=tree,
         user_id=user_id,
-        semantic=semantic,
-        progress_cb=progress_callback_count(self, title="Updating search index..."),
+        progress_cb=progress_callback_count(title="Updating search index..."),
     )
 
 
-@shared_task(bind=True)
-def search_reindex_incremental_semantic(self, tree: str, user_id: str) -> None:
-    """Run an incremental reindex of the semantic search index."""
-    return _search_reindex_incremental(
-        tree=tree,
-        user_id=user_id,
-        semantic=True,
-        progress_cb=progress_callback_count(
-            self, title="Updating semantic search index..."
-        ),
-    )
+def queue_search_index_build(tree: str, user_id: str) -> bool:
+    """Start building a tree's search index if it isn't built yet.
+
+    That is the case after an upgrade that changed the index, or for a tree
+    that was never indexed. Returns whether the index is being built.
+
+    Without a task queue, nothing is started: building in the request would
+    block it for minutes on a large tree. The frontend then asks an admin to
+    build the index instead. A failure to start is logged, not raised, so
+    that it doesn't break the request that triggered it.
+    """
+    if get_search_indexer(tree).is_built():
+        return False
+    if not current_app.config["CELERY_CONFIG"]:
+        return False
+    try:
+        run_task(search_reindex_full, tree=tree, user_id=user_id)
+    except HTTPException as exc:
+        if exc.code != HTTPStatus.CONFLICT:
+            logging.getLogger(__name__).warning(
+                "Could not start building the search index: %s", exc
+            )
+            return False
+        # 409: a task holding the search index lock, i.e. this build, runs
+    except Exception:  # pylint: disable=broad-except
+        logging.getLogger(__name__).warning(
+            "Could not start building the search index", exc_info=True
+        )
+        return False
+    return True
 
 
-@shared_task(bind=True)
+def update_search_indices_after_import(tree: str, user_id: str) -> list[dict[str, str]]:
+    """Bring the search indices up to date after an import or restore.
+
+    With a task queue, the reindex runs as separate tasks so that the import
+    result is available as soon as the data is committed and a failing reindex
+    cannot make the import look failed. Returns references to those tasks;
+    without a task queue, the reindex runs inline and nothing is returned.
+    """
+    result = run_task(search_reindex_incremental, tree=tree, user_id=user_id)
+    if isinstance(result, AsyncResult):
+        return [task_reference(result)]
+    return []
+
+
+@shared_task(bind=True, lock_key=LOCK_WRITE)
 def import_file(
     self,
     tree: str,
@@ -421,28 +477,13 @@ def import_file(
     finally:
         close_db(db_handle)
     update_usage_people(tree=tree, user_id=user_id)
-    _search_reindex_incremental(
-        tree=tree,
-        user_id=user_id,
-        semantic=False,
-        progress_cb=progress_callback_count(
-            self, title="Updating full-text search index..."
-        ),
-    )
-    indexer_semantic = get_current_semantic_search_indexer(tree)
-    if indexer_semantic is not None:
-        _reindex_incremental(
-            indexer_semantic,
-            tree=tree,
-            user_id=user_id,
-            progress_cb=progress_callback_count(
-                self, title="Updating semantic search index..."
-            ),
-        )
-    return {**object_counts, "messages": messages}
+    # imported media objects can refer to files already on disk
+    run_task(update_media_usage_task, tree=tree, user_id=user_id)
+    index_tasks = update_search_indices_after_import(tree=tree, user_id=user_id)
+    return {**object_counts, "messages": messages, "index_tasks": index_tasks}
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_WRITE)
 def restore_backup(
     self,
     tree: str,
@@ -457,56 +498,160 @@ def restore_backup(
     and, unless ``dry_run`` is set, applies it in a single transaction. Returns a
     per-object-type summary of the changeset in both cases.
     """
-    db_handle = get_db_outside_request(
-        tree=tree, view_private=True, readonly=dry_run, user_id=user_id
-    )
     try:
-        set_progress_title(self, title="Computing differences...")
-        backup_db = load_backup_db(file_name=file_name, extension=extension.lower())
-        try:
-            changeset = compute_reset_changeset(db_handle, backup_db)
-        finally:
-            backup_db.close()
-        summary = summarize_changeset(db_handle, changeset)
-        if dry_run:
-            return summary
-        check_quota_people(
-            to_add=max(0, changeset_people_delta(changeset)),
+        summary, _ = _reset_tree(
             tree=tree,
             user_id=user_id,
-        )
-        apply_reset_changeset(
-            db_handle,
-            changeset,
-            progress_cb=progress_callback_count(self, title="Restoring from backup..."),
+            file_name=file_name,
+            extension=extension,
+            dry_run=dry_run,
         )
     finally:
-        close_db(db_handle)
         try:
             os.remove(file_name)
         except OSError:
             pass
-
+    if dry_run:
+        return summary
     update_usage_people(tree=tree, user_id=user_id)
-    _search_reindex_incremental(
-        tree=tree,
-        user_id=user_id,
-        semantic=False,
-        progress_cb=progress_callback_count(
-            self, title="Updating full-text search index..."
-        ),
+    run_task(update_media_usage_task, tree=tree, user_id=user_id)
+    index_tasks = update_search_indices_after_import(tree=tree, user_id=user_id)
+    return {**summary, "index_tasks": index_tasks}
+
+
+def _reset_tree(
+    tree: str,
+    user_id: str,
+    file_name: str,
+    extension: str,
+    dry_run: bool,
+    check_media: bool = False,
+) -> tuple[dict[str, dict[str, int]], list[str] | None]:
+    """Reset a tree to the state of a backup file, see `restore_backup`.
+
+    Returns the changeset summary and, with `check_media`, the Gramps IDs of
+    the backup's media objects whose files don't exist.
+    """
+    db_handle = get_db_outside_request(
+        tree=tree, view_private=True, readonly=dry_run, user_id=user_id
     )
-    indexer_semantic = get_current_semantic_search_indexer(tree)
-    if indexer_semantic is not None:
-        _reindex_incremental(
-            indexer_semantic,
+    missing_media = None
+    try:
+        set_progress_title(title="Computing differences...")
+        backup_db = load_backup_db(file_name=file_name, extension=extension.lower())
+        try:
+            changeset = compute_reset_changeset(db_handle, backup_db)
+            if check_media:
+                missing_media = find_missing_media(
+                    get_media_handler(db_handle, tree=tree), backup_db
+                )
+        finally:
+            backup_db.close()
+        summary = summarize_changeset(db_handle, changeset)
+        if not dry_run:
+            check_quota_people(
+                to_add=max(0, changeset_people_delta(changeset)),
+                tree=tree,
+                user_id=user_id,
+            )
+            apply_reset_changeset(
+                db_handle,
+                changeset,
+                progress_cb=progress_callback_count(title="Restoring from backup..."),
+            )
+    finally:
+        close_db(db_handle)
+    return summary, missing_media
+
+
+@shared_task(bind=True, lock_key=LOCK_BACKUP)
+def create_backup(self, tree: str, user_id: str) -> dict[str, Any]:
+    """Create a stored backup archive of a tree and prune the oldest ones."""
+    store = get_backup_store()
+    backup_id, file_path = store.new_path(tree)
+    db_handle = get_db_outside_request(
+        tree=tree, view_private=True, readonly=True, user_id=user_id
+    )
+    try:
+        manifest = write_backup(
+            db_handle,
             tree=tree,
-            user_id=user_id,
-            progress_cb=progress_callback_count(
-                self, title="Updating semantic search index..."
-            ),
+            tree_name=get_db_manager(tree).name,
+            file_path=file_path,
+            user=UserTaskProgress(task=self),
         )
-    return summary
+    except HandleError:
+        abort_with_message(
+            422,
+            "The family tree contains a reference to a record that does "
+            "not exist, so it cannot be backed up. Running the check & "
+            "repair tool on the tree should fix this.",
+        )
+    finally:
+        close_db(db_handle)
+    store.prune(tree, keep=current_app.config["BACKUP_KEEP"])
+    return {
+        "id": backup_id,
+        "size": os.path.getsize(file_path),
+        "restorable": True,
+        "manifest": manifest,
+    }
+
+
+@shared_task(bind=True, lock_key=LOCK_WRITE)
+def restore_backup_archive(
+    self,
+    tree: str,
+    user_id: str,
+    file_name: str,
+    data: bool,
+    tree_settings: bool,
+    users: bool,
+    dry_run: bool = False,
+):
+    """Restore the selected parts of a tree from a backup archive.
+
+    The archive, an upload or a copy of a stored backup, must have been
+    validated with `read_backup` before, and is deleted afterwards. The Gramps
+    data is restored first, so that a failure there leaves the tree settings
+    and users untouched.
+    """
+    result: dict[str, Any] = {}
+    try:
+        backup = read_backup(file_name, verify=False)
+        result["manifest"] = backup.manifest
+        if data:
+            with tempfile.TemporaryDirectory(prefix="gramps-restore-") as directory:
+                summary, missing_media = _reset_tree(
+                    tree=tree,
+                    user_id=user_id,
+                    file_name=extract_data(file_name, directory),
+                    extension="gramps",
+                    dry_run=dry_run,
+                    check_media=True,
+                )
+            result["data"] = summary
+            result["missing_media"] = missing_media
+            if not dry_run:
+                # right away, so that the data is consistent with its usage and
+                # search indices even if restoring another part fails
+                update_usage_people(tree=tree, user_id=user_id)
+                run_task(update_media_usage_task, tree=tree, user_id=user_id)
+                result["index_tasks"] = update_search_indices_after_import(
+                    tree=tree, user_id=user_id
+                )
+        if tree_settings:
+            result["tree_settings"] = restore_tree_config(
+                tree, backup.tree_config, dry_run=dry_run
+            )
+        if users:
+            result["users"] = restore_users(tree, backup.users, dry_run=dry_run)
+    finally:
+        try:
+            os.remove(file_name)
+        except OSError:
+            pass
+    return result
 
 
 @shared_task(bind=True)
@@ -524,7 +669,7 @@ def export_db(
             extension,
             prepared_options,
             task=self,
-            progress=progress_callback_count(self, title="Exporting..."),
+            progress=progress_callback_count(title="Exporting..."),
         )
     finally:
         close_db(db_handle)
@@ -570,28 +715,54 @@ def generate_report(
 
 @shared_task(bind=True)
 def export_media(
-    self, tree: str, user_id: str, view_private: bool
+    self, tree: str, user_id: str, view_private: bool, file_name: str | None = None
 ) -> Dict[str, Union[str, int]]:
-    """Export media files."""
+    """Export media files to an archive named `file_name`.
+
+    The archive is built under a temporary name, so that concurrent exports of
+    the same archive never expose a partial file.
+    """
+    if file_name is None:
+        # queued before archives were named after their contents
+        file_name = f"{uuid.uuid4()}.zip"
     db_handle = get_db_outside_request(
         tree=tree, view_private=view_private, readonly=True, user_id=user_id
     )
     try:
         media_handler = get_media_handler(db_handle, tree=tree)
-        export_path = current_app.config["EXPORT_DIR"]
-        os.makedirs(export_path, exist_ok=True)
-        file_name = f"{uuid.uuid4()}.zip"
-        zip_filename = os.path.join(export_path, file_name)
-        media_handler.create_file_archive(
-            db_handle=db_handle,
-            zip_filename=zip_filename,
-            include_private=view_private,
-            progress_cb=progress_callback_count(self),
-        )
+        retention = current_app.config["EXPORT_RETENTION_SECONDS"]
+        # with S3 too, so that archives left by an interrupted upload expire
+        delete_expired_local_archives(retention)
+        archive_dir = get_local_archive_dir(tree)
+        os.makedirs(archive_dir, exist_ok=True)
+        # expires like an archive if left behind, but can't be downloaded
+        partial_filename = os.path.join(archive_dir, f"tmp-{uuid.uuid4()}.zip")
+        try:
+            media_handler.create_file_archive(
+                db_handle=db_handle,
+                zip_filename=partial_filename,
+                include_private=view_private,
+                progress_cb=progress_callback_count(),
+            )
+        except BaseException:
+            if os.path.exists(partial_filename):
+                os.remove(partial_filename)
+            raise
     finally:
         close_db(db_handle)
 
-    file_size = os.path.getsize(zip_filename)
+    try:
+        file_size = os.path.getsize(partial_filename)
+        if isinstance(media_handler, MediaHandlerS3):
+            # serve the archive from object storage rather than through the API
+            media_handler.upload_file_archive(
+                partial_filename, tree=tree, retention=retention, file_name=file_name
+            )
+        else:
+            os.replace(partial_filename, os.path.join(archive_dir, file_name))
+    finally:
+        if os.path.exists(partial_filename):
+            os.remove(partial_filename)
     return {
         "file_name": file_name,
         "url": f"/api/media/archive/{file_name}",
@@ -599,7 +770,7 @@ def export_media(
     }
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_WRITE)
 def import_media_archive(
     self, tree: str, user_id: str, file_name: str, delete: bool = True
 ):
@@ -615,7 +786,7 @@ def import_media_archive(
             file_name=file_name,
             delete=delete,
         )
-        result = importer(progress_cb=progress_callback_count(self))
+        result = importer(progress_cb=progress_callback_count())
     finally:
         close_db(db_handle)
     return result
@@ -643,14 +814,14 @@ def media_ocr(
         close_db(db_handle)
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_WRITE)
 def check_repair_database(self, tree: str, user_id: str):
     """Check and repair a Gramps database (tree)"""
     db_handle = get_db_outside_request(
         tree=tree, view_private=True, readonly=False, user_id=user_id
     )
     try:
-        return check_database(db_handle, progress_cb=progress_callback_count(self))
+        return check_database(db_handle, progress_cb=progress_callback_count())
     finally:
         close_db(db_handle)
 
@@ -676,12 +847,12 @@ def verify_database(
         close_db(db_handle)
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_WRITE)
 def upgrade_database_schema(self, tree: str, user_id: str):
     """Upgrade the schema of the Gramps database and the associated undo database."""
-    set_progress_title(self, title="Upgrading Gramps database schema...")
+    set_progress_title(title="Upgrading Gramps database schema...")
     upgrade_gramps_database(tree=tree, user_id=user_id, task=self)
-    set_progress_title(self, title="Upgrading undo database schema...")
+    set_progress_title(title="Upgrading undo database schema...")
     db_handle = get_db_outside_request(
         tree=tree, view_private=True, readonly=False, user_id=user_id
     )
@@ -691,7 +862,7 @@ def upgrade_database_schema(self, tree: str, user_id: str):
         close_db(db_handle)
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, lock_key=LOCK_WRITE)
 def delete_objects(
     self, tree: str, user_id: str, namespaces: Optional[List[str]] = None
 ):
@@ -703,30 +874,18 @@ def delete_objects(
         delete_all_objects(
             db_handle=db_handle,
             namespaces=namespaces,
-            progress_cb=progress_callback_count(self),
+            progress_cb=progress_callback_count(),
         )
     finally:
         close_db(db_handle)
 
     update_usage_people(tree=tree, user_id=user_id)
+    run_task(update_media_usage_task, tree=tree, user_id=user_id)
     _search_reindex_incremental(
         tree=tree,
         user_id=user_id,
-        semantic=False,
-        progress_cb=progress_callback_count(
-            self, title="Updating full-text search index..."
-        ),
+        progress_cb=progress_callback_count(title="Updating full-text search index..."),
     )
-    indexer_semantic = get_current_semantic_search_indexer(tree)
-    if indexer_semantic is not None:
-        _reindex_incremental(
-            indexer_semantic,
-            tree=tree,
-            user_id=user_id,
-            progress_cb=progress_callback_count(
-                self, title="Updating semantic search index..."
-            ),
-        )
 
 
 @shared_task(bind=True)
@@ -763,6 +922,8 @@ def apply_transactions(
         item["type"] == "add" and item["_class"] == "Person" for item in payload
     )
     num_people_new = num_people_added - num_people_deleted
+    # adding, deleting or re-pointing a media object changes the media usage
+    media_changed = any(item.get("_class") == "Media" for item in payload)
     check_quota_people(to_add=num_people_new, tree=tree, user_id=user_id)
     db_handle = get_db_outside_request(
         tree=tree, view_private=True, readonly=False, user_id=user_id
@@ -809,6 +970,8 @@ def apply_transactions(
         close_db(db_handle)
     if num_people_new:
         update_usage_people(tree=tree, user_id=user_id)
+    if media_changed:
+        run_task(update_media_usage_task, tree=tree, user_id=user_id)
     return trans_dict
 
 
@@ -847,7 +1010,7 @@ def old_unchanged(db: DbReadBase, class_name: str, handle: str, old_data: Dict) 
 
 
 def _index_objects(
-    indexer: SearchIndexer | SemanticSearchIndexer,
+    indexer: SearchIndexer,
     trans_dict: list[dict],
     db_handle: DbReadBase,
 ) -> None:
@@ -881,6 +1044,25 @@ def _index_objects(
             )
 
 
+@shared_task(lock_key=LOCK_MEDIA_USAGE)
+def update_media_usage_task(tree: str, user_id: str) -> None:
+    """Recompute and store the media usage for a tree.
+
+    Recomputing scans every media object's file, so this is run as a task
+    rather than inline in the request, the same way search index updates are.
+
+    Declared with a coalescing lock key (see util/task_state.py): a dispatch
+    arriving while a rescan is already running for this tree is folded into
+    it rather than queuing a second one, and the running rescan re-runs once
+    more before releasing the lock. Rescans of a tree therefore never run
+    concurrently, and uploads arriving faster than a rescan share it; uploads
+    slower than a rescan, such as a sync uploading files one by one, still
+    get one rescan each. Upload endpoints add the file size to the usage
+    right away, so quota checks don't wait for the rescan.
+    """
+    update_usage_media(tree=tree, user_id=user_id)
+
+
 @shared_task(bind=True)
 def update_search_indices_from_transaction(
     self, trans_dict: list[dict], tree: str, user_id: str
@@ -891,9 +1073,6 @@ def update_search_indices_from_transaction(
     )
     try:
         _index_objects(get_search_indexer(tree), trans_dict, db_handle)
-        indexer_semantic = get_current_semantic_search_indexer(tree)
-        if indexer_semantic is not None:
-            _index_objects(indexer_semantic, trans_dict, db_handle)
     finally:
         close_db(db_handle)
 
@@ -946,34 +1125,24 @@ def process_chat(
 ) -> dict[str, Any]:
     """Process a chat query with the AI agent."""
     # import here to avoid error if AI dependencies are not installed
-    from gramps_webapi.api.llm import (
-        answer_with_agent,
-        extract_metadata_from_result,
-        sanitize_answer,
-    )
     from pydantic_ai import ModelMessagesTypeAdapter
 
-    # Capture the task ID in the main worker thread before run_sync hands off
-    # tool calls to a thread-pool executor. Celery stores self.request in a
-    # thread-local, so self.request.id is None inside executor threads.
-    task_id = self.request.id
+    from gramps_webapi.api.llm import (
+        answer_with_agent,
+        clean_answer,
+        extract_metadata_from_result,
+    )
+
+    # Create the reporter in the main worker thread: run_sync hands off tool
+    # calls to a thread-pool executor, which has no task context.
+    report = progress_reporter()
     step = 0
-    if task_id is not None:
-        self.update_state(
-            task_id=task_id,
-            state="PROGRESS",
-            meta={"step": 0, "tool": "", "message": "Processing your query..."},
-        )
+    report({"step": 0, "tool": "", "message": "Processing your query..."})
 
     def progress_callback(tool_name: str, message: str) -> None:
         nonlocal step
         step += 1
-        if task_id is not None:
-            self.update_state(
-                task_id=task_id,
-                state="PROGRESS",
-                meta={"step": step, "tool": tool_name, "message": message},
-            )
+        report({"step": step, "tool": tool_name, "message": message})
 
     result = answer_with_agent(
         prompt=query,
@@ -985,7 +1154,12 @@ def process_chat(
         message_history_raw=message_history_raw,
     )
 
-    response_text = sanitize_answer(result.response.text or "")
+    response_text = clean_answer(
+        result.response.text or "",
+        tree=tree,
+        include_private=include_private,
+        user_id=user_id,
+    )
     response_dict: dict[str, Any] = {
         "response": response_text,
         "message_history_raw": ModelMessagesTypeAdapter.dump_json(

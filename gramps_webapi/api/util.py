@@ -28,10 +28,11 @@ import logging
 import os
 import smtplib
 import socket
+from contextlib import contextmanager
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from http import HTTPStatus
-from typing import Any, BinaryIO, NoReturn, Optional, Sequence
+from typing import Any, BinaryIO, Iterator, NoReturn, Optional, Sequence
 
 import gramps.gen.lib
 from celery import Task
@@ -98,6 +99,7 @@ from ..const import (
     TREE_MULTI,
 )
 from ..dbmanager import WebDbManager
+from ..util.task_state import progress_reporter
 from .auth import has_permissions
 
 
@@ -145,8 +147,13 @@ class ModifiedPrivateProxyDb(PrivateProxyDb):
         return self.db.get_summary()
 
     def get_surname_list(self):
-        """Return the list of locale-sorted surnames contained in the database."""
-        return self.db.get_surname_list()
+        """Return the sorted surnames of people whose primary name is visible."""
+        visible = set()
+        for person in self.db.iter_people():
+            name = person.get_primary_name()
+            if not person.private and not name.private:
+                visible.add(name.get_primary_surname().get_surname())
+        return [surname for surname in self.db.get_surname_list() if surname in visible]
 
     def get_place_types(self):
         """Return custom place types assocated with places in the database."""
@@ -155,6 +162,32 @@ class ModifiedPrivateProxyDb(PrivateProxyDb):
     def set_name_group_mapping(self, name, group):
         """Set a name group mapping."""
         return self.db.set_name_group_mapping(name, group)
+
+    def find_backlink_handles(self, handle, include_classes=None):
+        """Find all non-private objects that reference the object handle.
+
+        PrivateProxyDb only skips private referencing objects. This also
+        skips objects that only reference the handle privately, e.g. a public
+        person with a private media reference, or with a note on a private
+        name: the sanitized object returned by the proxy no longer
+        references the handle.
+        """
+        for class_name, ref_handle in self.db.find_backlink_handles(
+            handle, include_classes
+        ):
+            get_method = self.method("get_%s_from_handle", class_name)
+            if get_method is None:
+                continue
+            try:
+                obj = get_method(ref_handle)
+            except HandleError:
+                continue
+            if obj is None:
+                continue
+            if any(
+                ref == handle for _, ref in obj.get_referenced_handles_recursively()
+            ):
+                yield (class_name, ref_handle)
 
     # the below methods are to fix a bug in Gramps.
     # can be removed once bug is fixed in Gramps and version
@@ -347,6 +380,7 @@ class UserTaskProgress(InfoCollectorMixin, UserBase):
             self, callback=self._callback, error=None, uistate=None, dbstate=None
         )
         self.task = task
+        self._report = progress_reporter()
         self.steps = 0
         self.current_step = 0
         self.progress_title = ""
@@ -354,10 +388,8 @@ class UserTaskProgress(InfoCollectorMixin, UserBase):
         self.info_messages = []
 
     def _update_state(self, meta: dict) -> None:
-        """Report progress, unless the task was called directly (no Celery)."""
-        if self.task is None or self.task.request.id is None:
-            return
-        self.task.update_state(state="PROGRESS", meta=meta)
+        """Report progress, unless running outside a tracked task."""
+        self._report(meta)
 
     def _callback(self, percentage, text=None):
         """Report only the percentage."""
@@ -819,13 +851,32 @@ def check_quota_ai(requested: int, tree: str | None = None) -> None:
         abort_with_message(405, "Not allowed by AI quota")
 
 
+@contextmanager
+def remove_file_on_error(file_path: str) -> Iterator[None]:
+    """Remove an uploaded file if handing it to a task fails.
+
+    A task that is rejected (e.g. because the tree is locked) or fails to be
+    dispatched never runs, so the cleanup it would do never happens.
+    """
+    try:
+        yield
+    except BaseException:
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+        raise
+
+
 def abort_with_message(
-    status: int, message: str, error_type: str | None = None
+    status: int,
+    message: str,
+    error_type: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> NoReturn:
-    """Abort with a JSON response."""
+    """Abort with a JSON response, adding ``extra`` to the error body."""
     error_body: dict[str, Any] = {"code": status, "message": message}
     if error_type is not None:
         error_body["type"] = error_type
+    error_body.update(extra or {})
     payload = {"error": error_body}
     response = Response(
         response=json.dumps(payload),
@@ -861,15 +912,21 @@ def get_total_number_of_objects(db_handle: DbReadBase):
     )
 
 
-def get_object_timestamps(db_handle: DbReadBase):
-    """Get a dictionary with change timestamps of all objects in the DB."""
-    d: dict[str, set[tuple[int, float | int]]] = {}
+def get_object_timestamps(
+    db_handle: DbReadBase,
+) -> dict[str, set[tuple[str, float | int]]]:
+    """Get change timestamps of all objects in the DB.
+
+    Returns a dictionary keyed by class name with sets of (handle, change
+    timestamp) tuples.
+    """
+    d: dict[str, set[tuple[str, float | int]]] = {}
     for class_name in PRIMARY_GRAMPS_OBJECTS:
         d[class_name] = set()
         iter_method = db_handle.method("iter_%s_handles", class_name)
         assert iter_method is not None, f"Method iter_{class_name}_handles not found"
+        query_method = db_handle.method("get_%s_from_handle", class_name)
         for handle in iter_method():
-            query_method = db_handle.method("get_%s_from_handle", class_name)
             obj = query_method(handle)
             d[class_name].add((handle, obj.change))
     return d

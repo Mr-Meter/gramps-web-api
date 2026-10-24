@@ -89,12 +89,21 @@ class DefaultConfig(object):
     IGNORE_DB_LOCK = False
     TREE_ID = ""
     CELERY_CONFIG: Dict[str, str] = {}
+    # seconds without heartbeat after which a running task counts as lost
+    TASK_HEARTBEAT_TIMEOUT = 300
+    # seconds after which a task still waiting in the queue counts as lost
+    TASK_QUEUE_TIMEOUT = 6 * 3600
     MEDIA_BASE_DIR = ""
     MEDIA_PREFIX_TREE = False
     REPORT_DIR = str(Path.cwd() / "report_cache")
     EXPORT_DIR = str(Path.cwd() / "export_cache")
+    EXPORT_RETENTION_SECONDS = 24 * 60 * 60
+    # no default: on most deployments it would be ephemeral storage
+    BACKUP_DIR = ""
+    BACKUP_KEEP = 5  # backups kept per tree
+    RATE_LIMIT_BACKUP = "10 per day"  # per tree
     NEW_DB_BACKEND = "sqlite"
-    RATE_LIMIT_MEDIA_ARCHIVE = "1 per day"
+    RATE_LIMIT_MEDIA_ARCHIVE = "1 per hour"
     REGISTRATION_DISABLED = False
     LOG_LEVEL = "INFO"
     LLM_BASE_URL = None
@@ -102,11 +111,11 @@ class DefaultConfig(object):
     LLM_MAX_CONTEXT_LENGTH = 50000
     LLM_MAX_REQUESTS = 15
     LLM_MAX_TOKENS = 200_000
+    LLM_MAX_OUTPUT_TOKENS = None
     LLM_SYSTEM_PROMPT = None
-    VECTOR_EMBEDDING_MODEL = ""  # Model name for semantic search embeddings
-    # If set, use remote OpenAI-compatible API instead of local model
+    # ignored since semantic search was removed in 3.25.0, see deprecations.py
+    VECTOR_EMBEDDING_MODEL = ""
     VECTOR_EMBEDDING_BASE_URL = None
-    # Optional API key for authenticated embedding providers
     VECTOR_EMBEDDING_API_KEY = None
     DISABLE_TELEMETRY = False
     SENTRY_DSN = ""

@@ -32,13 +32,14 @@ from flask_jwt_extended import JWTManager, verify_jwt_in_request
 from flask_jwt_extended.exceptions import WrongTokenError
 from gramps.gen.config import config as gramps_config
 from gramps.gen.config import set as setconfig
+from gramps.gen.db.utils import get_dbid_from_path
 from gramps.gen.errors import HandleError
 from PIL import Image
 
 from .api import api_blueprint
 from .api.cache import persistent_cache, request_cache, thumbnail_cache
 from .api.deprecations import DEPRECATED_ENV_OPTIONS, check_deprecations
-from .api.ratelimiter import limiter
+from .api.ratelimiter import limiter, limiter_per_tree, limiter_per_user
 from .api.resources.schemas import (
     CitationSchema,
     EventSchema,
@@ -51,7 +52,6 @@ from .api.resources.schemas import (
     SourceSchema,
     TagSchema,
 )
-from .api.search.embeddings import create_remote_embedding_function, load_model
 from .api.succession import should_check_now
 from .api.tasks import check_succession, run_task, send_telemetry_task
 from .api.telemetry import get_server_uuid, should_send_telemetry
@@ -63,7 +63,9 @@ from .branch_guard import BranchPermissionError
 from .config import DefaultConfig, DefaultConfigJWT
 from .const import API_PREFIX, ENV_CONFIG_FILE, TREE_MULTI, VERSION
 from .dbmanager import WebDbManager
+from .future_gramps import apply_patches as apply_future_gramps_patches
 from .sentry import init_sentry
+from .util import pin_postgres_driver
 from .util.celery import create_celery
 
 _LOG = logging.getLogger(__name__)
@@ -83,6 +85,8 @@ def deprecated_config_from_env(app):
 
 def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = True):
     """Flask application factory."""
+    apply_future_gramps_patches()
+
     app = Flask(__name__)
 
     app.logger.setLevel(logging.INFO)
@@ -111,6 +115,9 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
         if not app.config.get(option):
             raise ValueError(f"{option} must be specified")
 
+    # pin the driver once, so every user of the config gets psycopg2
+    app.config["USER_DB_URI"] = pin_postgres_driver(app.config["USER_DB_URI"])
+
     # environment variable to set the Gramps database path.
     # Needed for backwards compatibility from Gramps 6.0 onwards
     if db_path := os.getenv("GRAMPS_DATABASE_PATH"):
@@ -128,31 +135,33 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
         # Flask's plain-text handler would duplicate every record on stderr.
         app.logger.removeHandler(default_handler)
 
-    for deprecation in check_deprecations(app.config):
-        app.logger.warning(
-            "%s Support will be removed in Gramps Web API %s.",
-            deprecation["message"],
-            deprecation["removed_in"],
-        )
-
     if init_sentry(app):
         app.logger.info("Sentry error reporting enabled.")
 
+    tree_backend = None
     if app.config["TREE"] != TREE_MULTI:
         if app.config.get("TREE_ID"):
             # TREE_ID takes precedence: identify tree by dirname, never by name
-            WebDbManager(
+            dbmgr = WebDbManager(
                 dirname=app.config["TREE_ID"],
                 create_if_missing=False,
                 ignore_lock=app.config["IGNORE_DB_LOCK"],
             )
         else:
             # legacy: identify tree by display name
-            WebDbManager(
+            dbmgr = WebDbManager(
                 name=app.config["TREE"],
                 create_if_missing=True,
                 ignore_lock=app.config["IGNORE_DB_LOCK"],
             )
+        tree_backend = get_dbid_from_path(dbmgr.path)
+
+    for deprecation in check_deprecations(app.config, tree_backend=tree_backend):
+        app.logger.warning(
+            "%s Support will be removed in Gramps Web API %s.",
+            deprecation["message"],
+            deprecation["removed_in"],
+        )
 
     if app.config["TREE"] == TREE_MULTI and not app.config["MEDIA_PREFIX_TREE"]:
         warnings.warn(
@@ -223,7 +232,9 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
             )
 
     # enable gzip compression
-    Compress(app)
+    compress = Compress(app)
+    compress.compress_mimetypes_set.add("text/calendar")
+    app.config["COMPRESS_MIMETYPES"] = sorted(compress.compress_mimetypes_set)
 
     static_path = app.config.get("STATIC_PATH")
 
@@ -310,6 +321,8 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
             api.spec.components.schema(_schema_name, schema=_schema_cls())
 
     limiter.init_app(app)
+    limiter_per_user.init_app(app)
+    limiter_per_tree.init_app(app)
 
     # Flask 3.x removed the exc.response early-return from handle_http_exception,
     # so flask-smorest's handler now intercepts every HTTPException and reformats
@@ -402,17 +415,6 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
             user_db.session.rollback()  # pylint: disable=no-member
         user_db.session.close()  # pylint: disable=no-member
         user_db.session.remove()  # pylint: disable=no-member
-
-    if app.config.get("VECTOR_EMBEDDING_MODEL"):
-        if app.config.get("VECTOR_EMBEDDING_BASE_URL"):
-            app.config["_EMBEDDING_FUNCTION"] = create_remote_embedding_function(
-                base_url=app.config["VECTOR_EMBEDDING_BASE_URL"],
-                model_name=app.config["VECTOR_EMBEDDING_MODEL"],
-                api_key=app.config.get("VECTOR_EMBEDDING_API_KEY"),
-            )
-        else:
-            model = load_model(app.config["VECTOR_EMBEDDING_MODEL"])
-            app.config["_EMBEDDING_FUNCTION"] = model.encode
 
     @app.route("/ready", methods=["GET"])
     def ready():

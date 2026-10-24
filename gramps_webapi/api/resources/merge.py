@@ -41,13 +41,13 @@ from gramps_webapi.types import ResponseReturnValue
 from ...auth.const import PERM_DEL_OBJ, PERM_EDIT_OBJ
 from ..auth import require_permissions
 from ..blueprint import api_blueprint
-from ..search import (
-    SearchIndexer,
-    get_current_semantic_search_indexer,
-    get_search_indexer,
+from ..search import SearchIndexer, get_search_indexer
+from ..tasks import (
+    run_task,
+    update_media_usage_task,
+    update_search_indices_from_transaction,
 )
-from ..tasks import run_task, update_search_indices_from_transaction
-from ..util import get_db_handle, get_tree_from_jwt_or_fail
+from ..util import get_db_handle, get_tree_from_jwt_or_fail, update_usage_people
 from . import ProtectedResource
 from .emit import GrampsJSONEncoder
 from .util import abort_with_message
@@ -60,9 +60,6 @@ def _update_search_index(
     tree = get_tree_from_jwt_or_fail()
     indexer: SearchIndexer = get_search_indexer(tree)
     indexer.delete_object(handle=titanic_handle, class_name=class_name)
-    indexer_semantic = get_current_semantic_search_indexer(tree)
-    if indexer_semantic is not None:
-        indexer_semantic.delete_object(handle=titanic_handle, class_name=class_name)
     run_task(
         update_search_indices_from_transaction,
         trans_dict=[{"handle": phoenix_handle, "_class": class_name}],
@@ -133,6 +130,7 @@ class MergePersonResource(GrampsJSONEncoder, ProtectedResource):
             )
         except MergeError as exc:
             abort_with_message(409, str(exc))
+        update_usage_people()
         _update_search_index(titanic_handle, phoenix_handle, "Person")
         return self.response(200, {})
 
@@ -168,6 +166,8 @@ class MergeFamilyResource(GrampsJSONEncoder, ProtectedResource):
             abort_with_message(409, str(exc))
         except AssertionError:
             abort_with_message(400, "Invalid parent handle")
+        # merging the families can merge their parents, deleting people
+        update_usage_people()
         _update_search_index(titanic_handle, phoenix_handle, "Family")
         return self.response(200, {})
 
@@ -205,7 +205,11 @@ class _SimpleMergeResource(GrampsJSONEncoder, ProtectedResource):
         except MergeError as exc:
             abort_with_message(409, str(exc))
         _update_search_index(titanic_handle, phoenix_handle, self.gramps_class_name)
+        self._after_merge()
         return self.response(200, {})
+
+    def _after_merge(self) -> None:
+        """Hook for subclasses to run after a successful merge."""
 
 
 class MergeEventResource(_SimpleMergeResource):
@@ -248,6 +252,14 @@ class MergeMediaResource(_SimpleMergeResource):
 
     gramps_class_name = "Media"
     _merge_query_class = MergeMediaQuery
+
+    def _after_merge(self) -> None:
+        """Recompute the media usage, as titanic's file may no longer count."""
+        run_task(
+            update_media_usage_task,
+            tree=get_tree_from_jwt_or_fail(),
+            user_id=get_jwt_identity(),
+        )
 
 
 class MergeNoteResource(_SimpleMergeResource):

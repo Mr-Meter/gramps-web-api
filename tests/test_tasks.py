@@ -20,9 +20,16 @@
 """Tests for background tasks."""
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from gramps_webapi.api.tasks import _index_objects, progress_callback_count
+from celery.result import AsyncResult
+
+from gramps_webapi.api.tasks import (
+    _index_objects,
+    progress_callback_count,
+    search_reindex_incremental,
+    update_search_indices_after_import,
+)
 
 TRANS_DICT = [
     {"handle": "aaaa1111", "_class": "Person"},
@@ -101,27 +108,28 @@ def test_index_objects_indexes_every_object():
     ]
 
 
-def _make_task():
-    task = MagicMock()
-    task.request.id = "task-id"
-    return task
+def _progress_callback(**kwargs):
+    """Build a progress callback whose reports are collected in a mock."""
+    report = MagicMock()
+    with patch("gramps_webapi.api.tasks.progress_reporter", return_value=report):
+        callback = progress_callback_count(**kwargs)
+    return callback, report
 
 
 def test_progress_callback_count_throttles_per_object_calls():
     """A producer that calls back once per object with no `prev` (every
     producer feeding this callback except reindex_full: check_database,
     the media/media_importer/delete/restore tasks, and reindex_incremental's
-    own per-object loop) must still collapse to about one update_state()
-    call per integer percentage point, not one Redis write per object."""
-    task = _make_task()
-    callback = progress_callback_count(task, title="Reindexing")
+    own per-object loop) must still collapse to about one report per
+    integer percentage point, not one database write per object."""
+    callback, report = _progress_callback(title="Reindexing")
 
     total = 10_000
     for current in range(total):
         callback(current=current, total=total)
 
-    assert task.update_state.call_count < 150
-    assert task.update_state.call_count == len(
+    assert report.call_count < 150
+    assert report.call_count == len(
         {int(100 * current / total) for current in range(total)}
     )
 
@@ -129,24 +137,43 @@ def test_progress_callback_count_throttles_per_object_calls():
 def test_progress_callback_count_throttles_explicit_prev():
     """A producer that passes real `prev` values (reindex_full, batched by
     chunk_size) is throttled from those strides instead."""
-    task = _make_task()
-    callback = progress_callback_count(task)
+    callback, report = _progress_callback()
 
     callback(current=0, total=1000, prev=None)
-    assert task.update_state.call_count == 1
+    assert report.call_count == 1
     callback(current=5, total=1000, prev=0)  # still inside the 0% bucket
-    assert task.update_state.call_count == 1
+    assert report.call_count == 1
     callback(current=10, total=1000, prev=5)  # crosses into the 1% bucket
-    assert task.update_state.call_count == 2
+    assert report.call_count == 2
 
 
-def test_progress_callback_count_noop_without_task_id():
-    """No Celery request in flight (e.g. a task invoked synchronously in
-    tests) means update_state() would have nothing to attach to."""
-    task = _make_task()
-    task.request.id = None
-    callback = progress_callback_count(task)
+def _dispatch_reindex():
+    """Run `update_search_indices_after_import` as if a task queue were set up."""
+    with patch(
+        "gramps_webapi.api.tasks.run_task",
+        side_effect=lambda task, **kwargs: AsyncResult(f"id-{task.__name__}"),
+    ) as run_task:
+        result = update_search_indices_after_import(tree="tree", user_id="user")
+    return result, run_task
 
-    callback(current=0, total=100)
 
-    task.update_state.assert_not_called()
+def test_reindex_after_import_runs_as_separate_tasks():
+    """The import result must not wait for the reindex, but point to it."""
+    result, run_task = _dispatch_reindex()
+
+    run_task.assert_called_once_with(
+        search_reindex_incremental, tree="tree", user_id="user"
+    )
+    assert result == [
+        {
+            "href": "/api/tasks/id-search_reindex_incremental",
+            "id": "id-search_reindex_incremental",
+        }
+    ]
+
+
+def test_reindex_after_import_without_task_queue_returns_no_tasks():
+    """Without a task queue `run_task` reindexes inline and returns its result."""
+    with patch("gramps_webapi.api.tasks.run_task", return_value=None) as run_task:
+        assert update_search_indices_after_import(tree="tree", user_id="user") == []
+    run_task.assert_called_once()

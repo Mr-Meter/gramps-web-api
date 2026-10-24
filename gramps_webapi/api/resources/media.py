@@ -25,16 +25,20 @@ from http import HTTPStatus
 from typing import Dict
 
 from flask import Response, abort, request
+from flask_jwt_extended import get_jwt_identity
 from gramps.gen.const import GRAMPS_LOCALE as glocale
 from gramps.gen.db import DbTxn
 from gramps.gen.lib import Media
 from gramps.gen.utils.grampslocale import GrampsLocale
 
+from ...auth import add_tree_usage_media
 from ...auth.const import PERM_ADD_OBJ
+from ...util import get_extension
 from ..auth import require_permissions
 from ..file import process_file
-from ..media import check_quota_media, get_media_handler, update_usage_media
-from ..util import abort_with_message, get_tree_from_jwt
+from ..media import check_quota_media, get_media_handler
+from ..tasks import run_task, update_media_usage_task
+from ..util import abort_with_message, get_tree_from_jwt_or_fail
 from .base import (
     GrampsObjectProtectedResource,
     GrampsObjectResourceHelper,
@@ -46,7 +50,6 @@ from .util import (
     get_media_profile_for_object,
     transaction_to_json,
 )
-
 
 
 class MediaObjectResourceHelper(GrampsObjectResourceHelper):
@@ -77,12 +80,16 @@ class MediaObjectsResource(GrampsObjectsProtectedResource, MediaObjectResourceHe
     def post(self) -> Response:
         """Post a new object."""
         require_permissions([PERM_ADD_OBJ])
-        mime = request.content_type
+        mime = request.mimetype
         if not mime:
             abort_with_message(HTTPStatus.NOT_ACCEPTABLE, "Media type not recognized")
+        if not get_extension(mime):
+            abort_with_message(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Media type not supported"
+            )
         checksum, size, f = process_file(request.stream)
         check_quota_media(to_add=size)
-        tree = get_tree_from_jwt()
+        tree = get_tree_from_jwt_or_fail()
         media_handler = get_media_handler(self.db_handle, tree)
         media_handler.upload_file(f, checksum, mime)
         path = media_handler.get_default_filename(checksum, mime)
@@ -97,5 +104,9 @@ class MediaObjectsResource(GrampsObjectsProtectedResource, MediaObjectResourceHe
             except ValueError as exc:
                 abort_with_message(400, "Error while adding object")
             trans_dict = transaction_to_json(trans)
-        update_usage_media()
+        # recomputing usage scans every media file, so it's done in the
+        # background rather than blocking this request; until then, count the
+        # new file so that the next quota check doesn't use a stale usage
+        add_tree_usage_media(tree, size)
+        run_task(update_media_usage_task, tree=tree, user_id=get_jwt_identity())
         return self.response(201, trans_dict, total_items=len(trans_dict))

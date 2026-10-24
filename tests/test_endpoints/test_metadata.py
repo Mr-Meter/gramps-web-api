@@ -76,10 +76,23 @@ class TestMetadata(unittest.TestCase):
         # the rate limit mini-language is parsed server-side into amount per window
         self.assertEqual(
             server["rate_limit_media_archive"],
-            [{"amount": 1, "window_seconds": 86400}],
+            [{"amount": 1, "window_seconds": 3600}],
         )
         # no upload limit is configured in the test config, so the key is omitted
         self.assertNotIn("max_media_archive_upload_bytes", server)
+
+    def test_get_metadata_semantic_search_removed(self):
+        """Semantic search is never available, even if an embedding model is set."""
+        config = self.client.application.config
+        config["VECTOR_EMBEDDING_MODEL"] = "some-model"
+        try:
+            header = fetch_header(self.client, role=ROLE_GUEST)
+            rv = self.client.get(TEST_URL, headers=header)
+        finally:
+            config["VECTOR_EMBEDDING_MODEL"] = ""
+        self.assertEqual(rv.status_code, 200)
+        self.assertFalse(rv.json["server"]["semantic_search"])
+        self.assertTrue(rv.json["server"]["chat"])
 
     def test_get_metadata_server_visible_to_guest(self):
         """Test that the server block is returned for the lowest role, too."""
@@ -155,6 +168,27 @@ class TestMetadataDeprecations(unittest.TestCase):
         res = self._get_metadata(self.client, ROLE_OWNER)
         self.assertTrue(res["server"]["multi_tree"])
         self.assertNotIn("deprecations", res)
+
+    def _stored_options(self):
+        res = self._get_metadata(self.client, ROLE_ADMIN)
+        self.assertNotIn("s3cret", str(res["deprecations"]))
+        return [d["option"] for d in res["deprecations"]]
+
+    def test_option_stored_in_db_is_shown_until_the_config_matches(self):
+        """Listed without its value, until the app config has the same one."""
+        header = fetch_header(self.client, role=ROLE_ADMIN)
+        url = BASE_URL + "/config/EMAIL_HOST_PASSWORD/"
+        config = self.client.application.config
+        default = config["EMAIL_HOST_PASSWORD"]
+        rv = self.client.put(url, headers=header, json={"value": "s3cret"})
+        self.assertEqual(rv.status_code, 200)
+        try:
+            self.assertIn("EMAIL_HOST_PASSWORD", self._stored_options())
+            config["EMAIL_HOST_PASSWORD"] = "s3cret"
+            self.assertNotIn("EMAIL_HOST_PASSWORD", self._stored_options())
+        finally:
+            config["EMAIL_HOST_PASSWORD"] = default
+            self.assertEqual(self.client.delete(url, headers=header).status_code, 200)
 
     def test_editor_never_sees_deprecations(self):
         """Below owner, the deprecations are hidden regardless of the tree mode."""

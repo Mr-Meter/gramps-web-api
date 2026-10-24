@@ -33,7 +33,7 @@ from threading import Thread
 import click
 import waitress  # type: ignore
 
-from .api.search import get_search_indexer, get_semantic_search_indexer
+from .api.search import get_search_indexer
 from .api.succession import evaluate_all_trees, evaluate_tree
 from .api.tasks import send_email_confirm_email, send_email_reset_password
 from .api.translate import translate_tree
@@ -279,11 +279,8 @@ def _single_tree_id(app) -> str:
 
 @cli.group("search", help="Manage the full-text search index.")
 @click.option("--tree", help="Tree ID", default=None)
-@click.option(
-    "--semantic/--fulltext",
-    help="Semantic rather than full-text search index",
-    default=False,
-)
+# ignored since semantic search was removed, accepted for existing scripts
+@click.option("--semantic/--fulltext", default=False, hidden=True)
 @click.pass_context
 def search(ctx, tree, semantic):
     app = ctx.obj["app"]
@@ -291,13 +288,7 @@ def search(ctx, tree, semantic):
     with app.app_context():
         ctx.obj["db_manager"] = get_db_manager(tree=tree)
         ctx.obj["tree"] = tree
-        ctx.obj["semantic"] = semantic
-        if semantic:
-            # Indexer is created per-subcommand so that index-full can pass
-            # skip_model_check=True while index-incremental keeps the check.
-            ctx.obj["search_indexer"] = None
-        else:
-            ctx.obj["search_indexer"] = get_search_indexer(tree=tree)
+        ctx.obj["search_indexer"] = get_search_indexer(tree=tree)
 
 
 def progress_callback_count_factory(app) -> ProgressCallback:
@@ -325,15 +316,7 @@ def index_full(ctx):
     app = ctx.obj["app"]
     app.logger.info("Rebuilding search index ...")
     db_manager = ctx.obj["db_manager"]
-    if ctx.obj["semantic"]:
-        with app.app_context():
-            # skip_model_check=True: this is the operation that *fixes* a
-            # mismatch, so it must never be blocked by one.
-            indexer = get_semantic_search_indexer(
-                tree=ctx.obj["tree"], skip_model_check=True
-            )
-    else:
-        indexer = ctx.obj["search_indexer"]
+    indexer = ctx.obj["search_indexer"]
     db = db_manager.get_db().db
 
     t0 = time.time()
@@ -353,13 +336,7 @@ def index_incremental(ctx):
     """Perform an incremental reindex."""
     app = ctx.obj["app"]
     db_manager = ctx.obj["db_manager"]
-    if ctx.obj["semantic"]:
-        with app.app_context():
-            # No skip_model_check: mixing old and new vectors in an incremental
-            # pass would silently corrupt the index; force a full reindex.
-            indexer = get_semantic_search_indexer(tree=ctx.obj["tree"])
-    else:
-        indexer = ctx.obj["search_indexer"]
+    indexer = ctx.obj["search_indexer"]
     db = db_manager.get_db().db
 
     try:

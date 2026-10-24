@@ -30,9 +30,19 @@ from .auth import jwt_required
 from .blueprint import api_blueprint
 from .cache import thumbnail_cache_decorator, tile_cache_decorator
 from .media import get_media_handler
-from .resources.access_tokens import UserAccessTokenResource
+from .resources.access_tokens import (
+    UserAccessTokenItemResource,
+    UserAccessTokenListResource,
+    UserAccessTokenResource,
+)
 from .resources.anniversaries import AnniversariesIcsResource
 from .resources.base import Resource, object_request_body
+from .resources.backups import (
+    BackupResource,
+    BackupRestoreResource,
+    BackupsResource,
+    BackupUploadRestoreResource,
+)
 from .resources.branches import BranchesResource
 from .resources.bookmarks import (
     BookmarkEditResource,
@@ -112,6 +122,8 @@ from .resources.ocr import MediaOcrResource
 from .resources.oidc import (
     OIDCCallbackResource,
     OIDCConfigResource,
+    OIDCLinkCompleteResource,
+    OIDCLinkResource,
     OIDCLoginResource,
     OIDCLogoutResource,
     OIDCTokenExchangeResource,
@@ -122,6 +134,7 @@ from .resources.places import (
     PlaceResource,
     PlacesResource,
 )
+from .resources.push_subscriptions import UserPushSubscriptionsResource
 from .resources.relations import RelationResource, RelationsResource
 from .resources.reports import (
     ReportFileResource,
@@ -165,6 +178,7 @@ from .resources.trees import (
     TreesResource,
     UpgradeTreeSchemaResource,
 )
+from .resources.oidc_accounts import UserOIDCAccountResource, UserOIDCAccountsResource
 from .resources.types import (
     CustomTypeResource,
     CustomTypesResource,
@@ -325,6 +339,13 @@ register_endpt(
     tags=["OIDC"],
 )
 register_endpt(OIDCLogoutResource, "/oidc/logout/", "oidclogoutresource", tags=["OIDC"])
+register_endpt(OIDCLinkResource, "/oidc/link/", "oidclinkresource", tags=["OIDC"])
+register_endpt(
+    OIDCLinkCompleteResource,
+    "/oidc/link/complete/",
+    "oidclinkcompleteresource",
+    tags=["OIDC"],
+)
 # People
 register_endpt(
     PersonTimelineResource,
@@ -791,6 +812,23 @@ register_endpt(
     ImporterResource, "/importers/<string:extension>", "importer", tags=["Importers"]
 )
 register_endpt(ImportersResource, "/importers/", "importers", tags=["Importers"])
+# Backups
+register_endpt(BackupsResource, "/backups/", "backups", tags=["Backups"])
+register_endpt(
+    BackupUploadRestoreResource,
+    "/backups/restore",
+    "backup-upload-restore",
+    tags=["Backups"],
+)
+register_endpt(
+    BackupResource, "/backups/<string:backup_id>", "backup", tags=["Backups"]
+)
+register_endpt(
+    BackupRestoreResource,
+    "/backups/<string:backup_id>/restore",
+    "backup-restore",
+    tags=["Backups"],
+)
 # Holidays
 register_endpt(
     HolidayResource,
@@ -860,9 +898,27 @@ register_endpt(
 register_endpt(UsersResource, "/users/", "users", tags=["Users"])
 register_endpt(UserResource, "/users/<string:user_name>/", "user", tags=["Users"])
 register_endpt(
+    UserPushSubscriptionsResource,
+    "/users/-/push-subscriptions/",
+    "user-push-subscriptions",
+    tags=["Users"],
+)
+register_endpt(
     UserAccessTokenResource,
     "/users/-/access-tokens/<string:scope>/",
     "user_access_token",
+    tags=["Users"],
+)
+register_endpt(
+    UserAccessTokenListResource,
+    "/users/-/access-tokens/<string:scope>/tokens/",
+    "user_access_token_list",
+    tags=["Users"],
+)
+register_endpt(
+    UserAccessTokenItemResource,
+    "/users/-/access-tokens/<string:scope>/tokens/<int:token_id>/",
+    "user_access_token_item",
     tags=["Users"],
 )
 register_endpt(
@@ -896,6 +952,18 @@ register_endpt(
     UserTriggerResetPasswordResource,
     "/users/<string:user_name>/password/reset/trigger/",
     "trigger_reset_password",
+    tags=["Users"],
+)
+register_endpt(
+    UserOIDCAccountsResource,
+    "/users/-/oidc-accounts/",
+    "user_oidc_accounts",
+    tags=["Users"],
+)
+register_endpt(
+    UserOIDCAccountResource,
+    "/users/-/oidc-accounts/<int:account_id>/",
+    "user_oidc_account",
     tags=["Users"],
 )
 # Search

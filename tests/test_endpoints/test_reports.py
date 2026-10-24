@@ -29,6 +29,7 @@ from gramps.gen.dbstate import DbState
 
 from gramps_webapi.app import create_app
 from gramps_webapi.auth import add_user, user_db
+from gramps_webapi.auth.const import ROLE_GUEST
 from gramps_webapi.const import (
     ENV_CONFIG_FILE,
     REPORT_DEFAULTS,
@@ -76,6 +77,19 @@ class TestReports(unittest.TestCase):
     def test_get_reports_without_help(self):
         """Test invalid parameters and values."""
         check_success(self, TEST_URL + "?include_help=0")
+
+    def test_get_reports_keeps_date_format(self):
+        """Test building the report options does not change the date format."""
+        check_success(self, TEST_URL)
+        rv = check_success(self, BASE_URL + "/living/9BXKQC1PVLPYFMD6IX/dates")
+        self.assertEqual(rv["birth"], "1999-04-11")
+
+    def test_get_reports_keeps_holiday_countries(self):
+        """Test building the report options does not add an empty country."""
+        check_success(self, TEST_URL)
+        rv = check_success(self, BASE_URL + "/holidays/")
+        self.assertNotIn("", rv)
+        self.assertEqual(rv, sorted(rv))
 
 
 class TestReportsReportId(unittest.TestCase):
@@ -218,6 +232,21 @@ class TestReportsReportIdFile(unittest.TestCase):
         check_invalid_semantics(
             self,
             TEST_URL + 'place_report/file?options={"places": "P0863 P9999"}',
+        )
+
+    def test_get_reports_report_id_file_parameter_options_validate_ids_guest(
+        self,
+    ):
+        """Test Gramps ID validation for a user without permission to view private records."""
+        check_success(
+            self,
+            TEST_URL + 'ancestor_report/file?options={"pid": "I0044"}',
+            role=ROLE_GUEST,
+        )
+        check_invalid_semantics(
+            self,
+            TEST_URL + 'ancestor_report/file?options={"pid": "I9999"}',
+            role=ROLE_GUEST,
         )
 
     def test_get_reports_report_id_file_parameter_options_validate_semantics_lists(

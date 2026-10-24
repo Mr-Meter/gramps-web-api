@@ -18,6 +18,7 @@
 #
 
 """Timeline API resources."""
+
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from flask import abort
@@ -119,6 +120,7 @@ class Timeline:
         """Initialize timeline."""
         self.db_handle = db_handle
         self.timeline: List[Tuple[Event, Person, str, str]] = []
+        self.timeline_handles: Set[str] = set()
         self.dates = dates
         self.start_date = None
         self.end_date = None
@@ -272,15 +274,15 @@ class Timeline:
         if self.start_date:
             if self.start_date.match(event[0].date, comparison=">"):
                 return
-        for item in self.timeline:
-            if item[0].handle == event[0].handle:
-                return
+        if event[0].handle in self.timeline_handles:
+            return
         if self.is_eligible(event[0], relative):
             if self.ratings:
                 count, confidence = get_rating(self.db_handle, event[0])
                 event[0].citations = count
                 event[0].confidence = confidence
             self.timeline.append(event)
+            self.timeline_handles.add(event[0].handle)
 
     def add_person(
         self,
@@ -295,6 +297,9 @@ class Timeline:
         if self.anchor_person and handle == self.anchor_person.handle:
             return
         person = self.db_handle.get_person_from_handle(handle)
+        if person is None:
+            # the private proxy returns None for private people
+            raise HandleError(f"Handle {handle} not found")
         if person.handle not in self.birth_dates:
             event = get_birth_or_fallback(self.db_handle, person)
             if event:
@@ -335,15 +340,28 @@ class Timeline:
     def add_relative(self, handle: Handle, ancestors: int = 1, offspring: int = 1):
         """Add events for a relative of the anchor person."""
         person = self.db_handle.get_person_from_handle(handle)
+        if person is None:
+            # the private proxy returns None for private people
+            raise HandleError(f"Handle {handle} not found")
+        # English string for filtering and recursion, localized one for display
+        relationship_en = ""
+        if self.relative_filters or ancestors > 1:
+            calculator = get_relationship_calculator(
+                reinit=True, clocale=default_locale
+            )
+            calculator.set_depth(self.depth)
+            relationship_en = calculator.get_one_relationship(
+                self.db_handle, self.anchor_person, person, olocale=default_locale
+            )
         calculator = get_relationship_calculator(reinit=True, clocale=self.locale)
         calculator.set_depth(self.depth)
         relationship = calculator.get_one_relationship(
-            self.db_handle, self.anchor_person, person
+            self.db_handle, self.anchor_person, person, olocale=self.locale
         )
         if self.relative_filters:
             found = False
             for relative in self.relative_filters:
-                if relative in relationship:
+                if relative in relationship_en:
                     found = True
                     break
             if not found:
@@ -381,7 +399,7 @@ class Timeline:
                     self.add_relative(child_ref.ref, offspring=offspring - 1)
 
         if ancestors > 1:
-            if "father" in relationship or "mother" in relationship:
+            if "father" in relationship_en or "mother" in relationship_en:
                 for family_handle in person.parent_family_list:
                     self.add_family(
                         family_handle, include_children=False, ancestors=ancestors - 1
@@ -398,6 +416,9 @@ class Timeline:
     ):
         """Add events for all family members to the timeline."""
         family = self.db_handle.get_family_from_handle(handle)
+        if family is None:
+            # the private proxy returns None for private families
+            raise HandleError(f"Handle {handle} not found")
         if anchor:
             for event_ref in family.event_ref_list:
                 event = self.db_handle.get_event_from_handle(event_ref.ref)

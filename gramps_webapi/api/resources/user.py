@@ -44,7 +44,7 @@ from ...auth import (
     modify_user,
 )
 from ...auth.branches import set_user_branches
-from ...auth.oidc_helpers import is_oidc_enabled
+from ...auth.oidc_helpers import is_local_auth_disabled, is_oidc_enabled
 from ...auth.const import (
     CLAIM_LIMITED_SCOPE,
     PERM_ADD_OTHER_TREE_USER,
@@ -118,6 +118,15 @@ def abort_if_last_owner(user_name: str, message: str) -> None:
         # somebody else can still administer the tree
         return
     abort_with_message(405, message)
+
+
+def abort_if_local_auth_disabled() -> None:
+    """Abort if local authentication is disabled.
+
+    For endpoints that set a password: it could never be used to log in.
+    """
+    if is_local_auth_disabled():
+        abort_with_message(405, "Local authentication is disabled")
 
 
 class UserChangeBase(ProtectedResource):
@@ -498,6 +507,7 @@ class UserResource(UserChangeBase):
         if user_name == "-":
             # Adding a new user does not make sense for "own" user
             abort(404)
+        abort_if_local_auth_disabled()
         if args["role"] >= ROLE_ADMIN:
             # only admins can create new admin users
             require_permissions([PERM_MAKE_ADMIN])
@@ -590,6 +600,9 @@ class UserRegisterResource(Resource):
         """Check if the registration is disabled."""
         if current_app.config["REGISTRATION_DISABLED"]:
             return True
+        # without local authentication, a registered user could never log in
+        if is_local_auth_disabled():
+            return True
         # check if there are tree owners or, in a single-tree setup,
         # tree admins
         if current_app.config["TREE"] == TREE_MULTI:
@@ -609,12 +622,14 @@ class UserRegisterResource(Resource):
         if user_name == "-":
             # Registering a new user does not make sense for "own" user
             abort(404)
+        # do not allow registration if no tree owner account exists!
+        # Checked before the tree argument, so that a disabled registration
+        # returns 405 in every setup. Without a tree, owners of any tree count.
+        if self._is_disabled(tree=args.get("tree")):
+            abort_with_message(405, "Registration is disabled")
         if not args.get("tree") and current_app.config["TREE"] == TREE_MULTI:
             # if multi-tree is enabled, tree is required
             abort_with_message(422, "tree is required")
-        # do not allow registration if no tree owner account exists!
-        if self._is_disabled(tree=args.get("tree")):
-            abort_with_message(405, "Registration is disabled")
         if (
             "tree" in args
             and current_app.config["TREE"] != TREE_MULTI
@@ -684,6 +699,7 @@ class UserCreateOwnerResource(LimitedScopeProtectedResource):
         if user_name == "-":
             # User name - is not allowed
             abort(404)
+        abort_if_local_auth_disabled()
         claims = get_jwt()
         if "tree" in args and not tree_exists(args["tree"]):
             abort_with_message(422, "Tree does not exist")
@@ -749,6 +765,7 @@ class UserChangePasswordResource(UserChangeBase):
     @api_blueprint.arguments(UserChangePasswordBodyArgs, location="json")
     def post(self, args, user_name: str):
         """Post new password."""
+        abort_if_local_auth_disabled()
         user_name, _ = self.prepare_edit(user_name)
         if not args["new_password"]:
             abort_with_message(400, "Empty password provided")
@@ -764,6 +781,7 @@ class UserTriggerResetPasswordResource(Resource):
     @limiter.limit("1/second")
     def post(self, user_name):
         """Post username to initiate the password reset."""
+        abort_if_local_auth_disabled()
         if user_name == "-":
             return "", 201
         details = get_user_details(user_name)
@@ -811,6 +829,7 @@ class UserResetPasswordResource(LimitedScopeProtectedResource):
     @api_blueprint.arguments(UserResetPasswordBodyArgs, location="json")
     def post(self, args):
         """Post new password."""
+        abort_if_local_auth_disabled()
         if not args["new_password"]:
             abort_with_message(400, "Empty password provided")
         claims = get_jwt()
@@ -832,6 +851,7 @@ class UserResetPasswordResource(LimitedScopeProtectedResource):
 
     def get(self):
         """Reset password form."""
+        abort_if_local_auth_disabled()
         user_id = get_jwt_identity()
         try:
             username = get_name(user_id)

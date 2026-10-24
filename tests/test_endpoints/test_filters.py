@@ -20,11 +20,27 @@
 
 """Tests for the /api/filters endpoints using example_gramps."""
 
+import importlib.util
 import json
+import os
+import struct
+import sys
+import tempfile
 import uuid
 import unittest
+from unittest.mock import patch
 
+import gramps.gen.filters.rules.person as person_rules
+from gramps.gen.filters.rules import Rule
+from gramps.gen.plug import BasePluginManager
+from gramps.gen.utils.grampslocale import GrampsLocale
 from jsonschema import validate
+
+from gramps_webapi.api.resources.filters import (
+    _RULE_CLASS_CACHE,
+    get_addon_translation,
+    get_rule_map,
+)
 from gramps_webapi.auth.const import ROLE_GUEST, ROLE_OWNER
 from gramps_webapi.const import GRAMPS_NAMESPACES
 
@@ -829,6 +845,50 @@ class TestExcludedRules(unittest.TestCase):
         assert rv.status_code == 404
 
 
+class AddonRule(Rule):
+    """Stands in for the rule of an addon."""
+
+    name = "People of an addon"
+    description = "Matches no person"
+    category = "General filters"
+
+    def apply_to_one(self, db, person):
+        return False
+
+
+class TestAddonRulesBeforeDatabase(unittest.TestCase):
+    """Addon rules are available if /filters comes before loading a database."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = get_test_client()
+
+    def test_addon_rule_after_filters_request(self):
+        """Building the rule map registers the plugins first."""
+        headers = fetch_header(self.client)
+
+        def reg_plugins(*args, **kwargs):
+            # registering an addon adds its rules to the rule modules
+            person_rules.AddonRule = AddonRule
+
+        self.addCleanup(vars(person_rules).pop, "AddonRule", None)
+        # as in a new process: no rules cached, no plugins registered
+        with (
+            patch.dict(_RULE_CLASS_CACHE, clear=True),
+            patch("gramps_webapi.dbloader._plugins_registered", False),
+            patch.object(BasePluginManager, "reg_plugins", side_effect=reg_plugins),
+        ):
+            rv = self.client.get(TEST_URL + "people?rules=AddonRule", headers=headers)
+            assert rv.status_code == 200
+            rv = self.client.get(
+                "/api/people/",
+                query_string={"rules": '{"rules":[{"name":"AddonRule"}]}'},
+                headers=headers,
+            )
+            assert rv.status_code == 200
+            assert rv.json == []
+
+
 class TestCrossNamespaceFilters(unittest.TestCase):
     """Cross-namespace sub-filters using the namespace field on nested groups."""
 
@@ -1370,3 +1430,250 @@ class TestRuleParamTypes(unittest.TestCase):
             {"type": "datetime"},
             {"type": "datetime"},
         ]
+
+
+class TestRuleTranslation(unittest.TestCase):
+    """Rule descriptions are translated into the requested locale."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = get_test_client()
+        cls.translate = GrampsLocale(lang="de").translation.gettext
+
+    def _rule(self, namespace, rule, query=""):
+        rv = check_success(self, f"{TEST_URL}{namespace}?rules={rule}{query}")
+        return rv["rules"][0]
+
+    def test_without_locale_unchanged(self):
+        """Without locale, rules are described by their class attributes."""
+        for namespace in GRAMPS_NAMESPACES:
+            rv = check_success(self, TEST_URL + namespace)
+            rule_map = get_rule_map(GRAMPS_NAMESPACES[namespace])
+            for rule in rv["rules"]:
+                rule_class = rule_map[rule["rule"]]
+                assert rule["name"] == rule_class.name
+                assert rule["description"] == rule_class.description
+                assert rule["category"] == rule_class.category
+                assert rule["labels"] == rule_class.labels
+
+    def test_with_locale(self):
+        """Name, description, category and labels are translated."""
+        rule = self._rule("people", "HasBirth", "&locale=de")
+        expected = {
+            "name": "People with the <birth data>",
+            "description": "Matches people with birth data of a particular value",
+            "category": "Event filters",
+        }
+        for key, english in expected.items():
+            assert self.translate(english) != english
+            assert rule[key] == self.translate(english)
+        assert rule["labels"] == [
+            self.translate(label) for label in ["Date:", "Place:", "Description:"]
+        ]
+
+    def test_select_labels(self):
+        """Labels of select options are translated, values are not."""
+        types = self._rule("people", "HasNote", "&locale=de")["types"]
+        assert types[1]["options"] == [
+            {"value": value, "label": self.translate(value)}
+            for value in ["less than", "equal to", "greater than"]
+        ]
+        assert self.translate("less than") != "less than"
+        types = self._rule("places", "WithinArea", "&locale=de")["types"]
+        assert types[2]["options"][0] == {
+            "value": "0",
+            "label": self.translate("kilometers"),
+        }
+
+    def test_own_rule(self):
+        """Our own rules translate the strings Gramps has translations for."""
+        rule = self._rule("people", "HasAssociationType", "&locale=de")
+        assert rule["labels"] == [self.translate("Type:")]
+        assert rule["category"] == self.translate("General filters")
+        assert rule["name"] == "People with association of type <type>"
+
+    def test_all_namespaces(self):
+        """The endpoint for all namespaces takes a locale, too."""
+        rv = check_success(self, f"{TEST_URL}?locale=de")
+        rule = next(r for r in rv["people"]["rules"] if r["rule"] == "HasBirth")
+        assert rule["category"] == self.translate("Event filters")
+
+    def test_unknown_locale(self):
+        """An unknown language code falls back to English."""
+        rule = self._rule("people", "HasBirth", "&locale=xx")
+        assert rule["category"] == "Event filters"
+
+
+def write_mo(path, messages):
+    """Write a gettext catalog with the given translations to path."""
+    messages = {"": "Content-Type: text/plain; charset=UTF-8\n", **messages}
+    keys = sorted(messages)
+    ids = strs = b""
+    offsets = []
+    for key in keys:
+        key_bytes, value_bytes = key.encode(), messages[key].encode()
+        offsets.append((len(ids), len(key_bytes), len(strs), len(value_bytes)))
+        ids += key_bytes + b"\0"
+        strs += value_bytes + b"\0"
+    count = len(keys)
+    key_start = 7 * 4 + 16 * count
+    value_start = key_start + len(ids)
+    key_table = []
+    value_table = []
+    for id_offset, id_length, str_offset, str_length in offsets:
+        key_table += [id_length, key_start + id_offset]
+        value_table += [str_length, value_start + str_offset]
+    with open(path, "wb") as mo_file:
+        mo_file.write(
+            struct.pack("Iiiiiii", 0x950412DE, 0, count, 7 * 4, 7 * 4 + 8 * count, 0, 0)
+        )
+        mo_file.write(struct.pack(f"{4 * count}i", *key_table, *value_table))
+        mo_file.write(ids + strs)
+
+
+ADDON_RULE_SOURCE = """
+from gramps.gen.filters.rules import Rule
+
+
+class MyAddonRule(Rule):
+    labels = ["Age:", "Event type:"]
+    name = "People with an addon <age>"
+    description = "Matches people with an addon age"
+    category = "General filters"
+"""
+
+
+class TestAddonRuleTranslation(unittest.TestCase):
+    """Addon rules are translated with the addon's own translations."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = get_test_client()
+        cls.translate = GrampsLocale(lang="de").translation.gettext
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        addon_dir = cls.tmpdir.name
+        module_path = os.path.join(addon_dir, "myaddonrule.py")
+        with open(module_path, "w", encoding="utf-8") as module_file:
+            module_file.write(ADDON_RULE_SOURCE)
+        mo_dir = os.path.join(addon_dir, "locale", "de", "LC_MESSAGES")
+        os.makedirs(mo_dir)
+        write_mo(
+            os.path.join(mo_dir, "addon.mo"),
+            {
+                "People with an addon <age>": "Personen mit einem Addon-<Alter>",
+                "Matches people with an addon age": "Passt auf Personen mit Addon-Alter",
+                "Age:": "Addon-Alter:",
+            },
+        )
+        spec = importlib.util.spec_from_file_location("myaddonrule", module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["myaddonrule"] = module
+        spec.loader.exec_module(module)
+        cls.rule_class = module.MyAddonRule
+
+    @classmethod
+    def tearDownClass(cls):
+        del sys.modules["myaddonrule"]
+        cls.tmpdir.cleanup()
+
+    def _rule(self, query=""):
+        rules = {**get_rule_map("Person"), "MyAddonRule": self.rule_class}
+        with patch.dict(_RULE_CLASS_CACHE, {"Person": rules}):
+            rv = check_success(self, f"{TEST_URL}people?rules=MyAddonRule{query}")
+        return rv["rules"][0]
+
+    def test_addon_translation(self):
+        """Strings of the addon catalog are translated with it."""
+        rule = self._rule("&locale=de")
+        assert rule["name"] == "Personen mit einem Addon-<Alter>"
+        assert rule["description"] == "Passt auf Personen mit Addon-Alter"
+        # the addon catalog wins, the Gramps translations fill the gaps
+        assert rule["labels"] == ["Addon-Alter:", self.translate("Event type:")]
+        assert self.translate("Event type:") != "Event type:"
+        assert rule["category"] == self.translate("General filters")
+
+    def test_addon_without_locale_unchanged(self):
+        """Without locale, the addon rule is described by its attributes."""
+        rule = self._rule()
+        assert rule["name"] == "People with an addon <age>"
+        assert rule["labels"] == ["Age:", "Event type:"]
+
+    def test_addon_language_without_catalog(self):
+        """A language the addon has no catalog for uses the Gramps translations."""
+        rule = self._rule("&locale=fr")
+        assert rule["name"] == "People with an addon <age>"
+        french = GrampsLocale(lang="fr").translation.gettext
+        assert rule["category"] == french("General filters")
+
+    def test_no_addon_translation_for_other_rules(self):
+        """Rules of Gramps and of the API have no addon translations."""
+        for namespace, rule in [("Person", "HasBirth"), ("Person", "MatchesQuery")]:
+            rule_class = get_rule_map(namespace)[rule]
+            assert get_addon_translation(rule_class, ["de"]) is None
+
+
+class MyInteger:
+    """Stands in for the filter editor widget of the same name."""
+
+
+class MyLesserEqualGreater:
+    """Stands in for the filter editor widget of the same name."""
+
+
+class AgeOption(MyInteger):
+    """Widget derived from a known editor widget."""
+
+
+class ComparisonOption(MyLesserEqualGreater):
+    """Widget derived from a known editor widget."""
+
+
+class UnknownOption:
+    """Widget with an unknown value format."""
+
+
+class HasWidgetLabels(Rule):
+    """Rule declaring labels as (text, widget_class) pairs."""
+
+    labels = [
+        ("", ComparisonOption),
+        ("Age:", AgeOption),
+        ("Widget value:", UnknownOption),
+    ]
+    name = "People with widget labels"
+    description = "Matches people"
+    category = "General filters"
+
+
+class TestWidgetLabels(unittest.TestCase):
+    """Labels declared as (text, widget_class) pairs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = get_test_client()
+
+    def _rule(self, query=""):
+        with patch.dict(get_rule_map("Person"), {"HasWidgetLabels": HasWidgetLabels}):
+            rv = check_success(self, f"{TEST_URL}people?rules=HasWidgetLabels{query}")
+        return rv["rules"][0]
+
+    def test_labels_are_text(self):
+        """Labels are the text of the pair."""
+        assert self._rule()["labels"] == ["", "Age:", "Widget value:"]
+
+    def test_types_from_widget(self):
+        """Types come from the editor widget the widget derives from."""
+        types = self._rule()["types"]
+        assert [o["value"] for o in types[0]["options"]] == [
+            "less than",
+            "equal to",
+            "greater than",
+        ]
+        assert types[1] == {"type": "integer", "min": 0}
+        assert types[2] == {"type": "text", "custom": True}
+
+    def test_with_locale(self):
+        """Label texts are translated; an empty label stays empty."""
+        translate = GrampsLocale(lang="de").translation.gettext
+        rule = self._rule("&locale=de")
+        assert rule["labels"] == ["", translate("Age:"), "Widget value:"]

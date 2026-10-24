@@ -23,9 +23,6 @@ ENV GRAMPSWEB_EXPORT_DIR=/app/cache/export
 ENV GRAMPSHOME=/root
 ENV GRAMPS_DATABASE_PATH=/root/.gramps/grampsdb
 
-# Model is baked into the base image - disable HF Hub network calls at runtime
-ENV HF_HUB_OFFLINE=1
-
 # copy package source and install
 COPY . /app/src
 RUN pip install --no-cache-dir /app/src[ai,sentry]
@@ -37,4 +34,4 @@ EXPOSE 5000
 
 COPY docker-entrypoint.sh /
 ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD gunicorn -w ${GUNICORN_NUM_WORKERS:-8} -b 0.0.0.0:5000 gramps_webapi.wsgi:app --timeout ${GUNICORN_TIMEOUT:-120} --limit-request-line 8190
+CMD exec gunicorn -w ${GUNICORN_NUM_WORKERS:-8} -b 0.0.0.0:5000 gramps_webapi.wsgi:app --timeout ${GUNICORN_TIMEOUT:-120} --limit-request-line 8190

@@ -22,8 +22,8 @@
 
 import secrets
 import uuid
-from hashlib import sha256
 from datetime import datetime
+from hashlib import sha256
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 import sqlalchemy as sa
@@ -33,12 +33,14 @@ from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql.functions import coalesce
 
-
 from ..const import DB_CONFIG_ALLOWED_KEYS
 from .const import (
+    ACCESS_TOKEN_LABEL_MAX_LENGTH,
+    ACCESS_TOKEN_MAX_PER_SCOPE,
     ACCESS_TOKEN_SCOPES,
-    PERMISSIONS,
+    ACCESS_TOKEN_SCOPES_MULTIPLE,
     PERM_USE_CHAT,
+    PERMISSIONS,
     ROLE_ADMIN,
     ROLE_OWNER,
     ROLE_UNCONFIRMED,
@@ -47,6 +49,8 @@ from .passwords import hash_password, verify_password
 from .sql_guid import GUID
 
 user_db = SQLAlchemy()
+
+MAX_PUSH_SUBSCRIPTIONS_PER_USER = 20
 
 
 def add_user(
@@ -150,7 +154,7 @@ def get_tree(guid: str) -> Optional[str]:
 
 
 def delete_user(name: str) -> None:
-    """Delete an existing user and their associated OIDC accounts."""
+    """Delete a user with their OIDC accounts, push subscriptions, branches and plans."""
     query = user_db.session.query(User)  # pylint: disable=no-member
     user = query.filter_by(name=name).scalar()
     if user is None:
@@ -159,6 +163,9 @@ def delete_user(name: str) -> None:
     # Manually delete associated OIDC accounts first.
     # This is needed because SQLite does not enforce foreign key constraints by default.
     user_db.session.query(OIDCAccount).filter_by(
+        user_id=user.id
+    ).delete()  # pylint: disable=no-member
+    user_db.session.query(PushSubscription).filter_by(
         user_id=user.id
     ).delete()  # pylint: disable=no-member
     delete_user_branches(user.id)
@@ -298,14 +305,30 @@ def normalize_access_token_scope(scope: str) -> str:
     return normalized_scope
 
 
-def _hash_access_token(token: str) -> str:
-    """Return deterministic SHA-256 hash for a persistent access token."""
-    return sha256(token.encode("utf-8")).hexdigest()
+def _normalize_single_token_scope(scope: str) -> str:
+    """Normalize a scope that has a single token per user, or raise."""
+    scope = normalize_access_token_scope(scope)
+    if scope in ACCESS_TOKEN_SCOPES_MULTIPLE:
+        raise ValueError("Access token scope allows several tokens per user")
+    return scope
+
+
+def _normalize_multiple_token_scope(scope: str) -> str:
+    """Normalize a scope that allows several tokens per user, or raise."""
+    scope = normalize_access_token_scope(scope)
+    if scope not in ACCESS_TOKEN_SCOPES_MULTIPLE:
+        raise ValueError("Access token scope allows a single token per user")
+    return scope
+
+
+def _hash_string(value: str) -> str:
+    """Return the deterministic SHA-256 hash of a UTF-8 string."""
+    return sha256(value.encode("utf-8")).hexdigest()
 
 
 def has_user_access_token(username: str, scope: str) -> bool:
     """Return whether an active persistent access token exists for user+scope."""
-    scope = normalize_access_token_scope(scope)
+    scope = _normalize_single_token_scope(scope)
     query = user_db.session.query(User)  # pylint: disable=no-member
     user = query.filter_by(name=username).scalar()
     if user is None:
@@ -322,7 +345,7 @@ def has_user_access_token(username: str, scope: str) -> bool:
 
 def rotate_user_access_token(username: str, scope: str) -> str:
     """Generate and persist a new token value for user+scope."""
-    scope = normalize_access_token_scope(scope)
+    scope = _normalize_single_token_scope(scope)
     query = user_db.session.query(User)  # pylint: disable=no-member
     user = query.filter_by(name=username).scalar()
     if user is None:
@@ -331,7 +354,7 @@ def rotate_user_access_token(username: str, scope: str) -> str:
     access_token = query.filter_by(user_id=user.id, scope=scope).scalar()
     for _ in range(5):
         token = secrets.token_urlsafe(32)
-        token_hash = _hash_access_token(token)
+        token_hash = _hash_string(token)
         if access_token is None:
             access_token = AccessToken(user_id=user.id, scope=scope)
             user_db.session.add(access_token)  # pylint: disable=no-member
@@ -350,7 +373,7 @@ def rotate_user_access_token(username: str, scope: str) -> str:
 
 def revoke_user_access_token(username: str, scope: str) -> None:
     """Revoke token value for user+scope."""
-    scope = normalize_access_token_scope(scope)
+    scope = _normalize_single_token_scope(scope)
     query = user_db.session.query(User)  # pylint: disable=no-member
     user = query.filter_by(name=username).scalar()
     if user is None:
@@ -365,12 +388,104 @@ def revoke_user_access_token(username: str, scope: str) -> None:
     user_db.session.commit()  # pylint: disable=no-member
 
 
+class AccessTokenConflictError(ValueError):
+    """Raised when a token can't be created due to the user's existing tokens."""
+
+
+def list_user_access_tokens(username: str, scope: str) -> list["AccessToken"]:
+    """Return a user's tokens for a scope with several tokens, oldest first."""
+    scope = _normalize_multiple_token_scope(scope)
+    query = user_db.session.query(User)  # pylint: disable=no-member
+    user = query.filter_by(name=username).scalar()
+    if user is None:
+        raise ValueError("User does not exist")
+    query = user_db.session.query(AccessToken)  # pylint: disable=no-member
+    return (
+        query.filter(
+            AccessToken.user_id == user.id,
+            AccessToken.scope == scope,
+            AccessToken.token_hash.isnot(None),
+        )
+        .order_by(AccessToken.id)
+        .all()
+    )
+
+
+def create_user_access_token(
+    username: str, scope: str, label: str
+) -> tuple["AccessToken", str]:
+    """Create a labelled token for a scope with several tokens per user.
+
+    Return the new row and the token value, which is not stored and can't be
+    retrieved later. Raise ``AccessTokenConflictError`` if the user already
+    has a token with that label, or the maximum number of tokens.
+    """
+    scope = _normalize_multiple_token_scope(scope)
+    if not label:
+        raise ValueError("Access token label must not be empty")
+    existing = list_user_access_tokens(username, scope)
+    if any(other.label == label for other in existing):
+        raise AccessTokenConflictError("An access token with this label exists")
+    # Best effort: concurrent requests can exceed the limit slightly. It only
+    # keeps the table from growing without bound, so this isn't worth a lock.
+    if len(existing) >= ACCESS_TOKEN_MAX_PER_SCOPE:
+        raise AccessTokenConflictError("Maximum number of access tokens reached")
+    user_id = get_guid(username)
+    for _ in range(5):
+        token = secrets.token_urlsafe(32)
+        access_token = AccessToken(
+            user_id=user_id,
+            scope=scope,
+            label=label,
+            token_hash=_hash_string(token),
+        )
+        user_db.session.add(access_token)  # pylint: disable=no-member
+        try:
+            user_db.session.commit()  # pylint: disable=no-member
+            return access_token, token
+        except IntegrityError:
+            user_db.session.rollback()  # pylint: disable=no-member
+            # Retry if the token collided, but not if a concurrent request
+            # created a token with the same label.
+            if any(
+                other.label == label
+                for other in list_user_access_tokens(username, scope)
+            ):
+                raise AccessTokenConflictError(
+                    "An access token with this label exists"
+                ) from None
+    raise ValueError("Could not generate a unique access token")
+
+
+def delete_user_access_token(username: str, scope: str, token_id: int) -> bool:
+    """Delete a token of a scope with several tokens per user.
+
+    Return whether the user had a token with that ID in that scope.
+    """
+    scope = _normalize_multiple_token_scope(scope)
+    user_id = get_guid(username)
+    query = user_db.session.query(AccessToken)  # pylint: disable=no-member
+    deleted = query.filter_by(id=token_id, user_id=user_id, scope=scope).delete()
+    user_db.session.commit()  # pylint: disable=no-member
+    return deleted > 0
+
+
+def mark_access_token_used(token: str, scope: str) -> None:
+    """Record that a persistent access token was just used."""
+    scope = normalize_access_token_scope(scope)
+    query = user_db.session.query(AccessToken)  # pylint: disable=no-member
+    query.filter_by(token_hash=_hash_string(token), scope=scope).update(
+        {AccessToken.last_used_at: datetime.utcnow()}
+    )
+    user_db.session.commit()  # pylint: disable=no-member
+
+
 def get_user_from_access_token(token: str, scope: str) -> Optional["User"]:
     """Return user matching persistent access token value and scope."""
     if not token:
         return None
     scope = normalize_access_token_scope(scope)
-    token_hash = _hash_access_token(token)
+    token_hash = _hash_string(token)
     query = user_db.session.query(User)  # pylint: disable=no-member
     return (
         query.join(AccessToken, AccessToken.user_id == User.id)
@@ -382,6 +497,72 @@ def get_user_from_access_token(token: str, scope: str) -> Optional["User"]:
         )
         .scalar()
     )
+
+
+def upsert_user_push_subscription(
+    user_id: Union[str, uuid.UUID],
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+) -> None:
+    """Create or update a Web Push subscription for a user.
+
+    Push endpoints identify browser subscriptions globally. If a browser is
+    reused by another account, ownership is transferred to the current user so
+    the previous account cannot continue sending notifications to that device.
+    """
+    user_id = uuid.UUID(str(user_id))
+    endpoint_hash = _hash_string(endpoint)
+    for attempt in range(2):
+        query = user_db.session.query(PushSubscription)  # pylint: disable=no-member
+        subscription = query.filter_by(endpoint_hash=endpoint_hash).scalar()
+        if subscription is None or subscription.user_id != user_id:
+            count = query.filter_by(user_id=user_id).count()
+            if count >= MAX_PUSH_SUBSCRIPTIONS_PER_USER:
+                oldest = (
+                    query.filter_by(user_id=user_id)
+                    .order_by(PushSubscription.id.asc())
+                    .first()
+                )
+                if oldest is not None:
+                    user_db.session.delete(oldest)  # pylint: disable=no-member
+        if subscription is None:
+            subscription = PushSubscription(
+                user_id=user_id,
+                endpoint=endpoint,
+                endpoint_hash=endpoint_hash,
+            )
+            user_db.session.add(subscription)  # pylint: disable=no-member
+
+        subscription.user_id = user_id
+        subscription.endpoint = endpoint
+        subscription.p256dh = p256dh
+        subscription.auth = auth
+        try:
+            user_db.session.commit()  # pylint: disable=no-member
+            return
+        except IntegrityError:
+            user_db.session.rollback()  # pylint: disable=no-member
+            if attempt == 1:
+                raise
+
+
+def delete_user_push_subscription(
+    user_id: Union[str, uuid.UUID], endpoint: str
+) -> bool:
+    """Delete a user's Web Push subscription by endpoint."""
+    user_id = uuid.UUID(str(user_id))
+    endpoint_hash = _hash_string(endpoint)
+    subscription = (
+        user_db.session.query(PushSubscription)  # pylint: disable=no-member
+        .filter_by(user_id=user_id, endpoint_hash=endpoint_hash)
+        .scalar()
+    )
+    if subscription is None:
+        return False
+    user_db.session.delete(subscription)  # pylint: disable=no-member
+    user_db.session.commit()  # pylint: disable=no-member
+    return True
 
 
 def get_all_user_details(
@@ -623,6 +804,22 @@ def set_tree_usage(
     user_db.session.commit()  # pylint: disable=no-member
 
 
+def add_tree_usage_media(tree: str, size: int) -> None:
+    """Add `size` bytes to the tree's media usage.
+
+    Done atomically in the database, so concurrent uploads don't lose each
+    other's increment. An unknown usage is left alone, as the next quota check
+    computes it from scratch.
+    """
+    statement = (
+        sa.update(Tree)
+        .where(Tree.id == tree, Tree.usage_media.is_not(None))
+        .values(usage_media=Tree.usage_media + size)
+    )
+    user_db.session.execute(statement)  # pylint: disable=no-member
+    user_db.session.commit()  # pylint: disable=no-member
+
+
 def set_tree_details(
     tree: str,
     quota_media: Optional[int] = None,
@@ -715,6 +912,7 @@ def get_user_oidc_accounts(user_id: str) -> List[Dict[str, Any]]:
     oidc_accounts = query.filter_by(user_id=user_id).all()
     return [
         {
+            "id": account.id,
             "provider_id": account.provider_id,
             "subject_id": account.subject_id,
             "email": account.email,
@@ -722,6 +920,43 @@ def get_user_oidc_accounts(user_id: str) -> List[Dict[str, Any]]:
         }
         for account in oidc_accounts
     ]
+
+
+# Results of `unlink_oidc_account`.
+UNLINKED = "unlinked"
+UNLINK_NOT_FOUND = "not_found"
+UNLINK_LAST = "last"
+
+
+def unlink_oidc_account(user_id: str, account_id: int, allow_last: bool) -> str:
+    """Remove one of a user's OIDC accounts.
+
+    The last one is only removed if `allow_last` is true. Two unlinks at once
+    must not remove the last two, so the check runs under a write lock.
+    """
+    # A no-op update takes the write lock before reading: it locks the user's
+    # rows in PostgreSQL and the database in SQLite, where SELECT ... FOR UPDATE
+    # does nothing. A concurrent unlink waits for it and then reads the result.
+    user_db.session.execute(  # pylint: disable=no-member
+        sa.update(OIDCAccount)
+        .where(OIDCAccount.user_id == user_id)
+        .values(provider_id=OIDCAccount.provider_id)
+    )
+    accounts = (
+        user_db.session.query(OIDCAccount)  # pylint: disable=no-member
+        .filter_by(user_id=user_id)
+        .all()
+    )
+    account = next((a for a in accounts if a.id == account_id), None)
+    if account is None:
+        user_db.session.rollback()  # pylint: disable=no-member
+        return UNLINK_NOT_FOUND
+    if len(accounts) == 1 and not allow_last:
+        user_db.session.rollback()  # pylint: disable=no-member
+        return UNLINK_LAST
+    user_db.session.delete(account)  # pylint: disable=no-member
+    user_db.session.commit()  # pylint: disable=no-member
+    return UNLINKED
 
 
 class User(user_db.Model):  # type: ignore
@@ -761,10 +996,23 @@ class AccessToken(user_db.Model):  # type: ignore
         sa.DateTime, nullable=False, server_default=sa.func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True)
+    # empty for scopes with a single token per user
+    label: Mapped[str] = mapped_column(
+        sa.String(ACCESS_TOKEN_LABEL_MAX_LENGTH),
+        nullable=False,
+        default="",
+        server_default="",
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True)
 
     __table_args__ = (
-        sa.UniqueConstraint("user_id", "scope", name="uq_access_tokens_user_scope"),
+        sa.UniqueConstraint(
+            "user_id", "scope", "label", name="uq_access_tokens_user_scope_label"
+        ),
         sa.Index("ix_access_tokens_token_hash", "token_hash", unique=True),
+        # Token IDs are used to revoke tokens, so they must never be reused,
+        # which SQLite does for the highest ID without AUTOINCREMENT.
+        {"sqlite_autoincrement": True},
     )
 
     def __repr__(self):
@@ -773,6 +1021,27 @@ class AccessToken(user_db.Model):  # type: ignore
             f"<AccessToken(user_id='{self.user_id}', scope='{self.scope}', "
             f"revoked_at='{self.revoked_at}')>"
         )
+
+
+class PushSubscription(user_db.Model):  # type: ignore
+    """Browser Web Push subscription table class for SQLAlchemy."""
+
+    __tablename__ = "push_subscriptions"
+
+    id = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    user_id = mapped_column(
+        GUID, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    endpoint = mapped_column(sa.Text, nullable=False)
+    endpoint_hash = mapped_column(
+        sa.String(64), nullable=False, unique=True, index=True
+    )
+    p256dh = mapped_column(sa.Text, nullable=False)
+    auth = mapped_column(sa.Text, nullable=False)
+
+    def __repr__(self):
+        """Return a representation that does not expose subscription secrets."""
+        return f"<PushSubscription(id='{self.id}', user_id='{self.user_id}')>"
 
 
 class Config(user_db.Model):  # type: ignore
@@ -840,7 +1109,13 @@ class OIDCAccount(user_db.Model):  # type: ignore
 
 
 class TaskTree(user_db.Model):  # type: ignore
-    """Audit table linking Celery task IDs to the tree and user that triggered them."""
+    """Lifecycle of a background task: the source of truth for its state.
+
+    See gramps_webapi/util/task_state.py. ``lock_key`` is set only while the task is
+    active, so the unique constraint on (tree, lock_key) allows one active
+    task per tree and key, while finished tasks and unlocked tasks (NULL key)
+    never conflict.
+    """
 
     __tablename__ = "task_tree"
 
@@ -850,6 +1125,24 @@ class TaskTree(user_db.Model):  # type: ignore
     name: Mapped[str] = mapped_column(sa.String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime, nullable=False, server_default=sa.func.now()
+    )
+    # queued / running / succeeded / failed / lost; unknown for rows
+    # recorded before the lifecycle was tracked here
+    status: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="unknown"
+    )
+    lock_key: Mapped[str | None] = mapped_column(sa.String(64))
+    rerun: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(sa.DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(sa.DateTime)
+    # JSON: progress while running, return value or error payload when done
+    result: Mapped[str | None] = mapped_column(sa.Text)
+
+    __table_args__ = (
+        sa.UniqueConstraint("tree", "lock_key", name="uq_task_tree_tree_lock_key"),
     )
 
     def __repr__(self):

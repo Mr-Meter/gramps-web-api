@@ -13,7 +13,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "gramps[all]>=6.0.4,<6.1.0",
     "PYGObject<=3.50.0",
@@ -21,7 +21,7 @@ dependencies = [
     "Click>=7.0",
     "Flask>=2.1.0",
     "Flask-Caching>=2.0.0",
-    "Flask-Compress",
+    "Flask-Compress>=1.17",
     "Flask-Cors",
     "Flask-JWT-Extended>=4.2.1,!=4.4.0,!=4.4.1",
     "Flask-Limiter>=2.9.0",
@@ -32,7 +32,7 @@ dependencies = [
     "webargs",
     "SQLAlchemy>=2.0.0",
     "pdf2image",
-    "Pillow>=9.1.0,<12.0.0",
+    "Pillow>=11.2.1",
     "bleach[css]>=5.0.0",
     "jsonschema>=4",
     "ffmpeg-python",
@@ -41,25 +41,27 @@ dependencies = [
     "celery[redis]",
     "Unidecode",
     "pytesseract",
-    "gramps-object-query-language>=0.5.1,<0.6",
+    "gramps-object-query-language>=0.5.5,<0.6",
     "gramps-ql>=0.5.0",
-    "sifts>=1.4.0",
+    "psycopg2-binary",  # PostgreSQL driver for the user DB and search index
     "requests",
     "yclade>=0.5.0",
     "Authlib>=1.6.4",
     "gramps-gedcom7>=0.4.0",
     "flask-smorest",
     "typing-extensions>=4.13.0",
+    "pywebpush>=2.5.0,<3.0.0",
+    "cryptography>=47.0.0",
+    "py-vapid>=1.7.0",
 ]
 
 [project.optional-dependencies]
-# as upstream since it removed semantic search: sentence-transformers would pull
-# in PyTorch (with CUDA from PyPI), which the base image no longer has
 ai = ["pydantic-ai[openai]>=1.101.0,<2.0.0"]
+face = ["opencv-python-headless>=4.8,<6"]
 sentry = ["sentry-sdk[flask]>=2.0.0"]
 translate = ["ctranslate2>=4.5,<5", "sentencepiece>=0.2"]
 test = ["pytest", "PyYAML"]
-all = ["sentence-transformers>=4.1.0", "accelerate", "pydantic-ai[openai]>=1.101.0,<2.0.0", "sentry-sdk[flask]>=2.0.0", "ctranslate2>=4.5,<5", "sentencepiece>=0.2", "pytest", "PyYAML"]
+all = ["pydantic-ai[openai]>=1.101.0,<2.0.0", "opencv-python-headless>=4.8,<6", "sentry-sdk[flask]>=2.0.0", "ctranslate2>=4.5,<5", "sentencepiece>=0.2", "pytest", "PyYAML"]
 
 [project.urls]
 homepage = "https://github.com/gramps-project/gramps-web-api"

@@ -26,14 +26,16 @@ GTK), leaving out labels no rule uses. Labels it doesn't know are text.
 `_LABEL_TYPES` also covers labels the editor treats as text although their
 values have a specific format, and `_RULE_TYPES` covers labels whose meaning
 depends on the rule.
+
+A rule can also declare a label as a `(text, widget_class)` pair; the editor
+then uses that widget. Its type is taken from the editor widget it derives
+from (`_WIDGET_TYPES`); other widgets get type text, marked as custom.
 """
 
+from collections.abc import Callable
 from typing import Any
 
-from gramps.gen.const import GRAMPS_LOCALE as glocale
 from gramps.gen.filters.rules import Rule
-
-_ = glocale.translation.gettext
 
 TEXT: dict[str, Any] = {"type": "text"}
 BOOLEAN: dict[str, Any] = {"type": "boolean"}
@@ -81,8 +83,8 @@ _COMPARISON = _select(
     ]
 )
 
-# Keys are untranslated labels. Gramps rules use both translated and
-# untranslated labels, so lookups try both.
+# Keys are labels as Gramps rules declare them. The server locale is
+# always English, so they match.
 _LABEL_TYPES: dict[str, dict[str, Any]] = {
     # From the Gramps filter editor
     "Reference count:": _integer(0, 999),
@@ -154,11 +156,6 @@ _LABEL_TYPES: dict[str, dict[str, Any]] = {
     "Expression:": GOQL,
 }
 
-_LABEL_TYPES_ANY_LANGUAGE: dict[str, dict[str, Any]] = {
-    **{_(label): param_type for label, param_type in _LABEL_TYPES.items()},
-    **_LABEL_TYPES,
-}
-
 # Labels whose type depends on the rule: (namespace, rule) -> {index: type}
 _RULE_TYPES: dict[tuple[str, str], dict[int, dict[str, Any]]] = {
     ("Citation", "HasSourceIdOf"): {0: _id("Source")},
@@ -184,19 +181,70 @@ _RULE_TYPES: dict[tuple[str, str], dict[int, dict[str, Any]]] = {
 }
 
 
+# Widgets of the Gramps filter editor, by class name, whose values have a
+# known format. Widgets whose options or namespace are set when they are
+# created (MyID, MyFilters, MyList, MySelect) are not included.
+_WIDGET_TYPES: dict[str, dict[str, Any]] = {
+    "MyInteger": _integer(0),
+    "MyLesserEqualGreater": _COMPARISON,
+    "MyBoolean": BOOLEAN,
+    "MySource": _id("Source"),
+    "DateEntry": DATE,
+    "MyPlaces": TEXT,
+    "MyEntry": TEXT,
+}
+
+
+def get_label_text(label: str | tuple[str, Callable]) -> str:
+    """Return the text of a label, which may be a (text, widget_class) pair."""
+    if isinstance(label, tuple):
+        return label[0]
+    return label
+
+
+def _widget_type(widget_class: Callable) -> dict[str, Any]:
+    """Return the type of a parameter with its own widget."""
+    for cls in getattr(widget_class, "__mro__", ()):
+        if cls.__name__ in _WIDGET_TYPES:
+            return _WIDGET_TYPES[cls.__name__]
+    return {**TEXT, "custom": True}
+
+
 def _label_type(label: str, namespace: str) -> dict[str, Any]:
     """Return the type of a parameter from its label alone."""
-    if label in (_("ID:"), "ID:"):
+    if label == "ID:":
         return _id(namespace)
-    if label in (_("Filter name:"), "Filter name:"):
+    if label == "Filter name:":
         return _filter(namespace)
-    return _LABEL_TYPES_ANY_LANGUAGE.get(label, TEXT)
+    return _LABEL_TYPES.get(label, TEXT)
+
+
+def _param_type(label: str | tuple[str, Callable], namespace: str) -> dict[str, Any]:
+    """Return the type of a parameter from its label declaration."""
+    if isinstance(label, tuple):
+        return _widget_type(label[1])
+    return _label_type(label, namespace)
 
 
 def get_param_types(namespace: str, rule_class: type[Rule]) -> list[dict[str, Any]]:
     """Return the types of a rule's parameters, one per label."""
     overrides = _RULE_TYPES.get((namespace, rule_class.__name__), {})
     return [
-        overrides.get(index) or _label_type(label, namespace)
+        overrides.get(index) or _param_type(label, namespace)
         for index, label in enumerate(rule_class.labels)
     ]
+
+
+def translate_param_type(
+    param_type: dict[str, Any], translate: Callable[[str], str]
+) -> dict[str, Any]:
+    """Return a parameter type with the labels of its options translated."""
+    if "options" not in param_type:
+        return param_type
+    return {
+        **param_type,
+        "options": [
+            {**option, "label": translate(option["label"])}
+            for option in param_type["options"]
+        ],
+    }

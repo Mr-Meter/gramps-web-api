@@ -5,6 +5,7 @@ from celery import current_app as current_celery_app
 from werkzeug.exceptions import HTTPException
 
 from ..branch_guard import BranchPermissionError
+from .task_state import run_tracked
 
 
 class TaskError(Exception):
@@ -38,7 +39,11 @@ def create_celery(app):
                 return self.run(*args, **kwargs)
             with app.app_context():
                 try:
-                    return self.run(*args, **kwargs)
+                    return run_tracked(
+                        self.request.id,
+                        lambda: self.run(*args, **kwargs),
+                        fence=True,
+                    )
                 except BranchPermissionError as exc:
                     # a background write outside the user's branches: the
                     # request's fault, like a 403 from a request

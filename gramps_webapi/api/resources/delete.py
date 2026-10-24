@@ -39,7 +39,7 @@ from gramps.gen.utils.db import (
 )
 
 from ...const import GRAMPS_OBJECT_PLURAL
-from ..search import get_current_semantic_search_indexer, get_search_indexer
+from ..search import get_search_indexer
 from .util import transaction_to_json
 
 
@@ -598,11 +598,10 @@ def remove_deleted_from_search_indices(
 
     Deletions are cheap and applied right away. The remaining (non-delete)
     transaction records are returned so the caller can schedule them for
-    (re-)indexing in the background, since that requires (re-)computing
-    embeddings for semantic search.
+    (re-)indexing in the background, since that requires loading the
+    objects from the database.
     """
     indexer = get_search_indexer(tree)
-    indexer_semantic = get_current_semantic_search_indexer(tree)
     # An object can appear more than once in the same transaction (e.g. a
     # self-referencing object being both updated to remove the self-reference
     # and then deleted). Its final state - deleted - takes precedence, so we
@@ -617,10 +616,6 @@ def remove_deleted_from_search_indices(
         key = (item["handle"], item["_class"])
         if item["type"] == "delete":
             indexer.delete_object(handle=item["handle"], class_name=item["_class"])
-            if indexer_semantic is not None:
-                indexer_semantic.delete_object(
-                    handle=item["handle"], class_name=item["_class"]
-                )
         elif key not in deleted:
             trans_dict_to_reindex.append(item)
     return trans_dict_to_reindex
@@ -674,36 +669,35 @@ def delete_all_objects(
     i = 0
     delete_all = namespaces is None
     order = _FAST_DELETE_ORDER if delete_all else list(GRAMPS_OBJECT_PLURAL.keys())
-    for class_name in order:
-        namespace = GRAMPS_OBJECT_PLURAL[class_name]
-        if namespaces is not None and namespace not in namespaces:
-            continue
-        iter_handles = db_handle.method("iter_%s_handles", class_name)
-        if delete_all:
-            # Fast path: batch=True skips undo-data recording and signal emission.
-            # Materialize handles before opening the transaction to avoid cursor
-            # conflicts with the deletions that follow.
-            handles = list(iter_handles())
-            unset_default_person = (
-                class_name == "Person" and db_handle.get_default_handle() is not None
-            )
-            remove = getattr(db_handle, f"remove_{class_name.lower()}")
-            with DbTxn(f"Delete {class_name}", db_handle, batch=True) as trans:
-                if unset_default_person:
-                    db_handle.set_default_person_handle(None)
+    class_names = [
+        class_name
+        for class_name in order
+        if namespaces is None or GRAMPS_OBJECT_PLURAL[class_name] in namespaces
+    ]
+    unset_default_person = (
+        "Person" in class_names and db_handle.get_default_handle() is not None
+    )
+    # One transaction, so the commit isn't long before the close that updates
+    # the last change timestamp. batch=True skips undo data and signals.
+    with DbTxn(
+        f"Delete {namespaces or 'all objects'}", db_handle, batch=delete_all
+    ) as trans:
+        if unset_default_person:
+            db_handle.set_default_person_handle(None)
+        for class_name in class_names:
+            iter_handles = db_handle.method("iter_%s_handles", class_name)
+            if delete_all:
+                # Materialize handles before the deletions that follow to
+                # avoid cursor conflicts.
+                handles = list(iter_handles())
+                remove = getattr(db_handle, f"remove_{class_name.lower()}")
                 for handle in handles:
                     if progress_cb:
                         progress_cb(current=i, total=total)
                     i += 1
                     remove(handle, trans)
-        else:
-            del_method = delete_methods[class_name.lower()]
-            unset_default_person = (
-                class_name == "Person" and db_handle.get_default_handle() is not None
-            )
-            with DbTxn(f"Delete {namespaces}", db_handle) as trans:
-                if unset_default_person:
-                    db_handle.set_default_person_handle(None)
+            else:
+                del_method = delete_methods[class_name.lower()]
                 for handle in iter_handles():
                     if progress_cb:
                         progress_cb(current=i, total=total)

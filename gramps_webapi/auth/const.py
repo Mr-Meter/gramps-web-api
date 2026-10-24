@@ -58,6 +58,7 @@ PERM_ADD_OBJ = "AddObject"
 PERM_DEL_OBJ = "DeleteObject"
 PERM_DEL_OBJ_BATCH = "BatchDeleteObjects"
 PERM_IMPORT_FILE = "ImportFile"
+PERM_MANAGE_BACKUPS = "ManageBackups"
 PERM_VIEW_SETTINGS = "ViewSettings"
 PERM_EDIT_SETTINGS = "EditSettings"
 PERM_TRIGGER_REINDEX = "TriggerReindex"
@@ -104,6 +105,7 @@ PERMISSIONS[ROLE_OWNER] = PERMISSIONS[ROLE_EDITOR] | {
     PERM_EDIT_USER_ROLE,
     PERM_VIEW_OTHER_USER,
     PERM_IMPORT_FILE,
+    PERM_MANAGE_BACKUPS,
     PERM_TRIGGER_REINDEX,
     PERM_EDIT_TREE,
     PERM_REPAIR_TREE,
@@ -161,3 +163,9 @@ ACCESS_TOKEN_SCOPE_PERMISSIONS = {
         {PERM_VIEW_PRIVATE, PERM_ADD_OBJ, PERM_EDIT_OBJ, PERM_DEL_OBJ}
     ),
 }
+# Scopes where a user can hold several tokens, one per device, each with its
+# own label, so that one device can be revoked without affecting the others.
+# The other scopes have a single token per user that is rotated in place.
+ACCESS_TOKEN_SCOPES_MULTIPLE = frozenset({ACCESS_TOKEN_SCOPE_SYNC})
+ACCESS_TOKEN_MAX_PER_SCOPE = 20
+ACCESS_TOKEN_LABEL_MAX_LENGTH = 100

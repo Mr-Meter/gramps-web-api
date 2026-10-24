@@ -5,14 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from functools import wraps
+from typing import Callable, Collection
 
-from typing import Collection
-
-from flask import current_app, g, request
+from flask import Response, current_app, g, request
 from flask_caching import Cache
 from gramps.gen.errors import HandleError
 
 from gramps_webapi.api.auth import has_permissions
+from gramps_webapi.api.faces import FACE_DETECTION_VERSION
+from gramps_webapi.api.image import PDF_RENDER_VERSION
 from gramps_webapi.api.util import (
     get_db_handle,
     get_db_manager,
@@ -21,7 +23,7 @@ from gramps_webapi.api.util import (
 )
 from gramps_webapi.auth import get_all_user_details
 from gramps_webapi.auth.const import PERM_VIEW_PRIVATE
-from gramps_webapi.const import TREE_MULTI
+from gramps_webapi.const import MIME_PDF, TREE_MULTI
 
 thumbnail_cache = Cache()
 request_cache = Cache()
@@ -51,11 +53,23 @@ def _hash_request_args() -> str:
     # Exclude jwt (auth token) and checksum (frontend cache-busting hint;
     # the authoritative checksum is read from the DB in make_cache_key_thumbnails).
     excluded = {"jwt", "checksum"}
-    query_args = list((k, v) for (k, v) in request.args.items(multi=True) if k not in excluded)
+    query_args = list(
+        (k, v) for (k, v) in request.args.items(multi=True) if k not in excluded
+    )
     args_as_sorted_tuple = tuple(sorted(query_args))
     args_as_bytes = str(args_as_sorted_tuple).encode()
     arg_hash = hashlib.md5(args_as_bytes)
     return str(arg_hash.hexdigest())
+
+
+def thumbnail_key_suffix(mime: str) -> str:
+    """Return the end of a thumbnail cache key for a media object's MIME type.
+
+    Versioned for PDFs, so that thumbnails from an older renderer aren't used.
+    """
+    if mime == MIME_PDF:
+        return f":avif:pdf-v{PDF_RENDER_VERSION}"
+    return ":avif"
 
 
 def make_cache_key_thumbnails(*args, **kwargs):
@@ -70,7 +84,13 @@ def make_cache_key_thumbnails(*args, **kwargs):
 
     dbmgr = get_db_manager(tree)
 
-    cache_key = checksum + request.path + arg_hash + dbmgr.dirname + ":avif"
+    cache_key = (
+        checksum
+        + request.path
+        + arg_hash
+        + dbmgr.dirname
+        + thumbnail_key_suffix(g.cached_media.mime)
+    )
 
     return cache_key
 
@@ -90,6 +110,8 @@ def make_cache_key_request(*args, **kwargs):
         raise ValueError("Database last change timestamp is None")
 
     cache_key = tree_id + str(db_timestamp) + request.path + arg_hash + permission_hash
+    # reused for the ETag by request_cache_decorator
+    g.request_cache_key = cache_key
 
     return cache_key
 
@@ -118,9 +140,32 @@ def skip_cache_missing_media(*args, **kwargs) -> bool:
     return False
 
 
-request_cache_decorator = request_cache.cached(
+_request_cached = request_cache.cached(
     make_cache_key=make_cache_key_request, unless=skip_cache_condition_request
 )
+
+
+def request_cache_decorator(f: Callable) -> Callable:
+    """Cache the view's response and use the cache key as its ETag.
+
+    A cache key determines the response, so its hash is a valid ETag that,
+    unlike the hash of the body, is known before the view runs.
+    If caching is skipped, the response keeps its body-hash ETag.
+    """
+    cached_f = _request_cached(f)
+
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        g.pop("request_cache_key", None)
+        rv = cached_f(*args, **kwargs)
+        cache_key = g.pop("request_cache_key", None)
+        if cache_key and isinstance(rv, Response) and rv.status_code == 200:
+            rv.set_etag(hashlib.sha256(cache_key.encode()).hexdigest())
+        return rv
+
+    return wrapper
+
+
 thumbnail_cache_decorator = thumbnail_cache.cached(
     make_cache_key=make_cache_key_thumbnails, unless=skip_cache_missing_media
 )
@@ -193,6 +238,29 @@ tile_cache_decorator = thumbnail_cache.cached(
 )
 
 
+def make_cache_key_face_detection(*args, **kwargs):
+    """Make a cache key for face detection results."""
+    # The result only depends on the file, so key on its checksum rather than
+    # on the tree's last change, and on the detection version so that cached
+    # results are invalidated when the detection changes.
+    arg_hash = _hash_request_args()
+    tree = get_tree_from_jwt()
+    checksum = g.cached_media.checksum
+    dbmgr = get_db_manager(tree)
+    return (
+        checksum
+        + request.path
+        + arg_hash
+        + dbmgr.dirname
+        + f":faces-v{FACE_DETECTION_VERSION}"
+    )
+
+
+face_detection_cache_decorator = thumbnail_cache.cached(
+    make_cache_key=make_cache_key_face_detection, unless=skip_cache_missing_media
+)
+
+
 def _native_max_zoom_cache_key(checksum: str, bounds: list) -> str:
     """Make a cache key for the native max zoom of a georeferenced media file."""
     bounds_hash = hashlib.md5(json.dumps(bounds).encode()).hexdigest()
@@ -204,6 +272,8 @@ def get_cached_native_max_zoom(checksum: str, bounds: list) -> int | None:
     return persistent_cache.get(_native_max_zoom_cache_key(checksum, bounds))
 
 
-def set_cached_native_max_zoom(checksum: str, bounds: list, native_max_zoom: int) -> None:
+def set_cached_native_max_zoom(
+    checksum: str, bounds: list, native_max_zoom: int
+) -> None:
     """Cache the native max zoom for a georeferenced media file."""
     persistent_cache.set(_native_max_zoom_cache_key(checksum, bounds), native_max_zoom)

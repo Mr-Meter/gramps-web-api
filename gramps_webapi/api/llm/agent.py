@@ -40,6 +40,7 @@ from .tools import (
     get_current_date,
     get_event,
     get_family,
+    get_note,
     get_person,
     get_place,
     search_genealogy_database,
@@ -86,11 +87,14 @@ def _trim_history(
     return messages
 
 
-SYSTEM_PROMPT = """You are an assistant for answering questions about a user's family history.
+SEARCH_STRATEGY_FULLTEXT = """search_genealogy_database matches exact names or
+phrases literally; search for the specific words you expect in the records."""
+
+SYSTEM_PROMPT_TEMPLATE = """You are an assistant for answering questions about a user's family history.
 
 Always respond in the same language the user is writing in.
 
-Use the available tools to retrieve information from the genealogy database. Base your answers ONLY on what the tools return — never invent facts, dates, names, or relationships. If you cannot find the information, say so. If the user refers to themselves ("I", "my", "me"), ask for their name in the family tree.
+Use the available tools to retrieve information from the genealogy database. Base your answers ONLY on what the tools return — never invent facts, dates, names, or relationships. If you cannot find the information, say so. Always search the database before answering, even about well-known or historical people: the tree may contain them. If the tree does not record something (e.g. a person has no recorded children), do not keep searching: say so, mention related information you already found (e.g. in a note), and never fill gaps from general knowledge. If the user refers to themselves as a person in the family tree ("I", "me", "my grandfather"), ask for their name in the tree. "My tree" or "my family tree" just means the database you are searching.
 
 Answer what was asked. Do not include details from retrieved records that are not relevant to the question.
 
@@ -100,15 +104,12 @@ SEARCH STRATEGY
 Prefer filter_people / filter_families / filter_events for concrete criteria
 (names, dates, places) — they are more precise than search.
 
-For search_genealogy_database:
-- search_type="fulltext": exact names or phrases to match literally
-- search_type="semantic" (default): open-ended or conceptual queries; phrase
-  the query as a description of the content to find, not as a question about it.
+{search_strategy}
 
 
 MULTI-STEP LOOKUPS
 
-Call get_person, get_family, get_event, or get_place when you need details not in your current results. The links in tool results encode the object type in their path: `/person/ID` → get_person, `/family/ID` → get_family, `/event/ID` → get_event, `/place/ID` → get_place. Always use the matching tool for the link you are following.
+Call get_person, get_family, get_event, get_place, or get_note when you need details not in your current results. The links in tool results encode the object type in their path: `/person/ID` → get_person, `/family/ID` → get_family, `/event/ID` → get_event, `/place/ID` → get_place, `/note/ID` → get_note. Always use the matching tool for the link you are following. Records only show the beginning of their notes; call get_note when a note may contain the answer.
 
 
 RELATIONSHIP QUERIES
@@ -127,7 +128,7 @@ For "who did X marry" or "what children did X have", use get_person — it inclu
 
 FORMATTING
 
-Use Markdown freely. When tool results contain links like [Name](/person/I0044), include them in your response exactly as they appear — never modify the path and never drop the link. Every person, family, event, place, source, citation, repository, note, and media object should be linked."""
+Use Markdown freely. When tool results contain links like [Name](/person/I0044), include them in your response exactly as they appear — never modify the path and never drop the link. Every person, family, event, place, source, citation, repository, note, and media object should be linked. This includes the person the user asked about: the first time you mention them, link them using the name and link from the record you retrieved, not the user's wording. Different people often share the same name, so always use the link of the specific record you looked up. Example: "[Mary Smith](/person/I1234) was born on 3 May 1850 in [Bristol](/place/P0567).\""""
 
 
 def _has_provider_prefix(model_name: str) -> bool:
@@ -187,7 +188,9 @@ def create_agent(
             provider=provider,
         )
 
-    system_prompt = system_prompt_override or SYSTEM_PROMPT
+    system_prompt = system_prompt_override or SYSTEM_PROMPT_TEMPLATE.format(
+        search_strategy=SEARCH_STRATEGY_FULLTEXT
+    )
 
     agent = Agent(
         model,
@@ -201,6 +204,7 @@ def create_agent(
     agent.tool(get_family)
     agent.tool(get_event)
     agent.tool(get_place)
+    agent.tool(get_note)
     agent.tool(filter_people)
     agent.tool(filter_events)
     agent.tool(filter_families)

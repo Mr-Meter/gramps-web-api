@@ -15,28 +15,11 @@ from gramps_webapi.api.util import send_email
 from gramps_webapi.const import PRIMARY_GRAMPS_OBJECTS
 
 
-def test_fix_object_dict_localized_event_type():
-    """Test fix_object_dict with localized (German) event type string.
-
-    This tests the fix for localized type strings (e.g. German "Geburt").
-    Since _S2IMAP is built at module import time based on system locale,
-    we need to manually add the German string to simulate German locale.
-    """
-    event_dict = {"_class": "Event", "type": "Geburt"}
-    # Simulate German locale by adding German string to _S2IMAP
-    # _S2IMAP is built at import time; add German string for this test
-    had_geburt = "Geburt" in EventType._S2IMAP
-    old_geburt_value = EventType._S2IMAP.get("Geburt")
-    EventType._S2IMAP["Geburt"] = 12
-    try:
-        result = fix_object_dict(event_dict, "Event")
-        assert result["type"]["value"] == 12
-    finally:
-        if had_geburt:
-            EventType._S2IMAP["Geburt"] = old_geburt_value
-        else:
-            # Only remove the key if we introduced it
-            EventType._S2IMAP.pop("Geburt", None)
+def test_fix_object_dict_display_event_type():
+    """Test fix_object_dict with a display string that differs from XML."""
+    event_dict = {"_class": "Event", "type": "Bat Mitzvah"}
+    result = fix_object_dict(event_dict, "Event")
+    assert result["type"]["value"] == EventType.BAS_MITZVAH
 
 
 def test_fix_object_dict_xml_event_type():
@@ -804,3 +787,24 @@ def test_preload_event_backlinks_unknown_backend_without_treeid_returns_none():
 
     dbapi = _FakeDbapi(batches=[[("h1", "Person", "p1")], []])
     assert preload_event_backlinks(SomeFutureSharedBackend(dbapi)) is None
+
+
+@pytest.mark.parametrize(
+    "ext,mime",
+    [
+        (".geojson", "application/geo+json"),
+        (".kml", "application/vnd.google-earth.kml+xml"),
+        (".kmz", "application/vnd.google-earth.kmz"),
+        (".gpx", "application/gpx+xml"),
+    ],
+)
+def test_map_file_types_round_trip(ext, mime):
+    """Map overlay types must not depend on the host's mime.types.
+
+    Uploads derive the stored file name from the MIME type, so a type without
+    a known extension makes the upload fail -- `.gpx` is in no standard table.
+    """
+    from gramps_webapi.util import get_extension, get_type
+
+    assert get_extension(mime) == ext
+    assert get_type(ext) == mime

@@ -557,6 +557,46 @@ class TestCreateOrUpdateOidcUser:
             tree=None,
         )
 
+    @patch("gramps_webapi.auth.oidc.get_oidc_account")
+    @patch("gramps_webapi.auth.oidc.get_name")
+    @patch("gramps_webapi.auth.oidc.modify_user")
+    @patch("gramps_webapi.auth.oidc.get_provider_config")
+    def test_existing_user_without_name_claim(
+        self, mock_get_config, mock_modify, mock_get_name, mock_get_oidc
+    ):
+        """Test that a missing name claim preserves the stored full name."""
+        mock_get_oidc.return_value = "existing-user-guid"
+        mock_get_name.return_value = "testuser"
+        mock_get_config.return_value = {"username_claim": "preferred_username"}
+
+        userinfo = {
+            "sub": "provider-sub-123",
+            "preferred_username": "testuser",
+            "email": "test@example.com",
+        }
+
+        mock_app = MagicMock()
+        mock_app.config.get.return_value = "groups"
+
+        with patch("gramps_webapi.auth.oidc.current_app", mock_app):
+            with patch(
+                "gramps_webapi.auth.oidc.get_role_from_claims", return_value=None
+            ):
+                with patch(
+                    "gramps_webapi.api.util.get_tree_id_or_none",
+                    return_value="test_tree",
+                ):
+                    create_or_update_oidc_user(userinfo, "test_tree", "google")
+
+        # fullname=None leaves the stored full name untouched
+        mock_modify.assert_called_once_with(
+            name="testuser",
+            fullname=None,
+            email="test@example.com",
+            role=None,
+            tree=None,
+        )
+
     @patch("gramps_webapi.auth.oidc.get_oidc_account", return_value=None)
     @patch("gramps_webapi.auth.oidc.get_user_details", return_value=None)
     @patch("gramps_webapi.auth.oidc.add_user")
@@ -867,3 +907,41 @@ class TestInitOidc:
 
         # Should register all three providers
         assert mock_oauth.register.call_count == 3
+
+
+def _pkce_client(discovery=None, error=None):
+    client = MagicMock()
+    client.client_kwargs = {"scope": "openid"}
+    if error:
+        client.load_server_metadata.side_effect = error
+    else:
+        client.load_server_metadata.return_value = discovery or {}
+    return client
+
+
+@pytest.mark.parametrize(
+    "pkce,discovery,error,expected",
+    [
+        (True, {}, None, True),  # opted in, discovery irrelevant
+        (True, None, RuntimeError("down"), True),
+        (True, {"code_challenge_methods_supported": ["plain"]}, None, True),
+        (None, {"code_challenge_methods_supported": ["S256"]}, None, True),
+        (None, {"code_challenge_methods_supported": ["plain"]}, None, False),
+        (None, {}, None, False),
+        (None, None, RuntimeError("down"), False),
+        # set but empty, e.g. a blank environment variable: same as unset
+        ("", {"code_challenge_methods_supported": ["S256"]}, None, True),
+        ("", {}, None, False),
+        # explicitly opted out: discovery is ignored
+        (False, {"code_challenge_methods_supported": ["S256"]}, None, False),
+    ],
+)
+def test_configure_pkce(pkce, discovery, error, expected):
+    from gramps_webapi.auth.oidc import configure_pkce
+
+    client = _pkce_client(discovery, error)
+    assert configure_pkce(client, {"pkce": pkce}) is expected
+    if expected:
+        assert client.client_kwargs["code_challenge_method"] == "S256"
+    else:
+        assert "code_challenge_method" not in client.client_kwargs

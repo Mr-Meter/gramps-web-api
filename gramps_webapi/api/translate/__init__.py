@@ -215,9 +215,16 @@ def _settings() -> tuple[str, str]:
 def _dispatch(keys: list[Key]) -> None:
     """Have the keys translated: in the background, or right now without a queue."""
     # pylint: disable=import-outside-toplevel
-    from ..tasks import run_task, translate_content
+    from ..tasks import translate_content
 
-    run_task(translate_content, keys=[list(key) for key in keys])
+    payload = [list(key) for key in keys]
+    if current_app.config["CELERY_CONFIG"]:
+        # not through run_task: no task_tree row, which would stop the task's
+        # retries (a failed tracked task is not run again) and is no user's
+        # task to show anyway
+        translate_content.apply_async(kwargs={"keys": payload})
+    else:
+        translate_content(keys=payload)
 
 
 def _fetch(keys: set[Key], wait: bool) -> dict[Key, str]:

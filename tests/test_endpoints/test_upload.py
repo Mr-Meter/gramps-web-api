@@ -201,6 +201,78 @@ class TestUpload(unittest.TestCase):
         rv = self.client.get(f"/api/media/{handle}/file", headers=headers)
         self.assertEqual(rv.status_code, 200)
 
+    def test_upload_unsupported_media_type(self):
+        """A MIME type without a known file extension is rejected."""
+        img, checksum, size = get_image(4)
+        headers = get_headers(self.client, "admin", "123")
+        rv = self.client.post(
+            "/api/media/",
+            data=img.read(),
+            headers=headers,
+            content_type="application/x-no-such-type",
+        )
+        self.assertEqual(rv.status_code, 415)
+        img.seek(0)
+        rv = self.client.post(
+            "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        new_img, new_checksum, new_size = get_image(5)
+        rv = self.client.put(
+            f"/api/media/{handle}/file",
+            data=new_img.read(),
+            headers={**headers, "If-Match": checksum},
+            content_type="application/x-no-such-type",
+        )
+        self.assertEqual(rv.status_code, 415)
+        # the media object is unchanged
+        rv = self.client.get(f"/api/media/{handle}", headers=headers)
+        self.assertEqual(rv.json["checksum"], checksum)
+
+    def test_upload_gpx(self):
+        """GPX has no extension in the standard MIME tables but is supported."""
+        headers = get_headers(self.client, "admin", "123")
+        data = b'<?xml version="1.0"?><gpx version="1.1" creator="test"></gpx>'
+        rv = self.client.post(
+            "/api/media/",
+            data=data,
+            headers=headers,
+            content_type="application/gpx+xml",
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        rv = self.client.get(f"/api/media/{handle}", headers=headers)
+        self.assertEqual(rv.json["path"], f"{rv.json['checksum']}.gpx")
+
+    def test_upload_media_type_with_parameters(self):
+        """Parameters in the Content-Type header are ignored."""
+        headers = get_headers(self.client, "admin", "123")
+        data = b'{"type": "FeatureCollection", "features": []}'
+        rv = self.client.post(
+            "/api/media/",
+            data=data,
+            headers=headers,
+            content_type="application/geo+json; charset=utf-8",
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        rv = self.client.get(f"/api/media/{handle}", headers=headers)
+        checksum = rv.json["checksum"]
+        self.assertEqual(rv.json["path"], f"{checksum}.geojson")
+        self.assertEqual(rv.json["mime"], "application/geo+json")
+        data = b'<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"/>'
+        rv = self.client.put(
+            f"/api/media/{handle}/file",
+            data=data,
+            headers={**headers, "If-Match": checksum},
+            content_type="application/vnd.google-earth.kml+xml; charset=utf-8",
+        )
+        self.assertEqual(rv.status_code, 200)
+        rv = self.client.get(f"/api/media/{handle}", headers=headers)
+        self.assertEqual(rv.json["path"], f"{rv.json['checksum']}.kml")
+        self.assertEqual(rv.json["mime"], "application/vnd.google-earth.kml+xml")
+
 
 class TestUploadWithQuota(unittest.TestCase):
     @classmethod
@@ -255,3 +327,190 @@ class TestUploadWithQuota(unittest.TestCase):
             "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
         )
         assert rv.status_code == 405
+
+    def test_upload_quota_counts_pending_uploads(self):
+        """The quota counts an upload before its usage recompute has run.
+
+        Otherwise a sync uploading files one after the other could exceed
+        the quota by everything uploaded while the recompute is queued.
+        """
+        headers = get_headers(self.client, "admin", "123")
+        # unknown on a fresh tree, where the first quota check computes it
+        rv = self.client.get("/api/trees/-", headers=headers)
+        usage = rv.json.get("usage_media") or 0
+        img1, _, size1 = get_image(30)
+        img2, _, size2 = get_image(31)
+        rv = self.client.put(
+            "/api/trees/-",
+            json={"quota_media": usage + size1 + size2 - 1},
+            headers=headers,
+        )
+        assert rv.status_code == 200
+        # the recompute is queued but doesn't run
+        with patch("gramps_webapi.api.resources.media.run_task"):
+            rv = self.client.post(
+                "/api/media/",
+                data=img1.read(),
+                headers=headers,
+                content_type="image/jpeg",
+            )
+            assert rv.status_code == 201
+            rv = self.client.get("/api/trees/-", headers=headers)
+            assert rv.json["usage_media"] == usage + size1
+            rv = self.client.post(
+                "/api/media/",
+                data=img2.read(),
+                headers=headers,
+                content_type="image/jpeg",
+            )
+            assert rv.status_code == 405
+
+
+class TestUploadUsageBackgroundUpdate(unittest.TestCase):
+    """Check that the (expensive) usage recompute doesn't block the request."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.name = "Test Web API"
+        cls.dbman = CLIDbManager(DbState())
+        dirpath, _ = cls.dbman.create_new_db_cli(cls.name, dbid="sqlite")
+        cls.tree = os.path.basename(dirpath)
+        with patch.dict("os.environ", {ENV_CONFIG_FILE: TEST_AUTH_CONFIG}):
+            cls.app = create_app(config_from_env=False)
+        cls.app.config["TESTING"] = True
+        cls.media_base_dir = tempfile.mkdtemp()
+        cls.app.config["MEDIA_BASE_DIR"] = cls.media_base_dir
+        cls.client = cls.app.test_client()
+        with cls.app.app_context():
+            user_db.create_all()
+            add_user(name="admin", password="123", role=ROLE_ADMIN, tree=cls.tree)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dbman.remove_database(cls.name)
+        shutil.rmtree(cls.media_base_dir)
+
+    def test_upload_dispatches_usage_update_as_task(self):
+        """Adding a media object must hand the usage recompute to the task queue."""
+        from gramps_webapi.api.tasks import update_media_usage_task
+
+        headers = get_headers(self.client, "admin", "123")
+        img, checksum, size = get_image(0)
+        with patch(
+            "gramps_webapi.api.resources.media.run_task"
+        ) as mock_run_task:
+            rv = self.client.post(
+                "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
+            )
+        self.assertEqual(rv.status_code, 201)
+        mock_run_task.assert_called_once()
+        task = mock_run_task.call_args.args[0]
+        self.assertEqual(task.name, update_media_usage_task.name)
+
+    def test_update_file_dispatches_usage_update_as_task(self):
+        """Replacing a media file must hand the usage recompute to the task queue."""
+        from gramps_webapi.api.tasks import update_media_usage_task
+
+        headers = get_headers(self.client, "admin", "123")
+        img, checksum, size = get_image(1)
+        rv = self.client.post(
+            "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        new_img, new_checksum, new_size = get_image(2)
+        with patch("gramps_webapi.api.resources.file.run_task") as mock_run_task:
+            rv = self.client.put(
+                f"/api/media/{handle}/file",
+                data=new_img.read(),
+                headers={**headers, "If-Match": checksum},
+                content_type="image/jpeg",
+            )
+        self.assertEqual(rv.status_code, 200)
+        mock_run_task.assert_called_once()
+        task = mock_run_task.call_args.args[0]
+        self.assertEqual(task.name, update_media_usage_task.name)
+
+    def test_delete_media_dispatches_usage_update_as_task(self):
+        """Deleting a media object must hand the usage recompute to the task queue."""
+        from gramps_webapi.api.tasks import update_media_usage_task
+
+        headers = get_headers(self.client, "admin", "123")
+        img, checksum, size = get_image(3)
+        rv = self.client.post(
+            "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        with patch("gramps_webapi.api.resources.base.run_task") as mock_run_task:
+            rv = self.client.delete(f"/api/media/{handle}", headers=headers)
+        self.assertEqual(rv.status_code, 200)
+        tasks = [call.args[0] for call in mock_run_task.call_args_list]
+        self.assertIn(update_media_usage_task.name, [task.name for task in tasks])
+
+    def test_delete_media_by_handle_updates_usage(self):
+        """Bulk-deleting media by handle must also bring usage back down.
+
+        This covers DeleteObjectsByHandleResource, which previously only
+        resynced usage for the "people" namespace, leaving usage_media stale
+        after a bulk media delete.
+        """
+        headers = get_headers(self.client, "admin", "123")
+        img, checksum, size = get_image(12)
+        rv = self.client.post(
+            "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        rv = self.client.get("/api/trees/-", headers=headers)
+        self.assertEqual(rv.json["usage_media"], size)
+        rv = self.client.post(
+            "/api/objects/delete-by-handle/",
+            json={"namespace": "media", "handles": [handle]},
+            headers=headers,
+        )
+        self.assertEqual(rv.status_code, 200)
+        rv = self.client.get("/api/trees/-", headers=headers)
+        self.assertEqual(rv.json["usage_media"], 0)
+
+    def test_upload_duplicate_content_does_not_double_count_usage(self):
+        """Uploading the same file content twice must not double-count usage."""
+        headers = get_headers(self.client, "admin", "123")
+        img, checksum, size = get_image(10)
+        img_bytes = img.read()
+        rv = self.client.post(
+            "/api/media/", data=img_bytes, headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        rv = self.client.get("/api/trees/-", headers=headers)
+        usage_after_first = rv.json["usage_media"]
+        # upload the exact same content again as a second, distinct Media object
+        rv = self.client.post(
+            "/api/media/", data=img_bytes, headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        rv = self.client.get("/api/trees/-", headers=headers)
+        # storage is content-addressed, so the second object reuses the same
+        # file on disk - usage must not grow
+        self.assertEqual(rv.json["usage_media"], usage_after_first)
+
+    def test_delete_media_updates_usage(self):
+        """Deleting the last media object must bring usage back down to zero.
+
+        Without the task queue mocked out, run_task() executes inline (no
+        CELERY_CONFIG is set in this test app), so the recompute happens
+        synchronously here and can be asserted on directly.
+        """
+        headers = get_headers(self.client, "admin", "123")
+        img, checksum, size = get_image(11)
+        rv = self.client.post(
+            "/api/media/", data=img.read(), headers=headers, content_type="image/jpeg"
+        )
+        self.assertEqual(rv.status_code, 201)
+        handle = rv.json[0]["new"]["handle"]
+        rv = self.client.get("/api/trees/-", headers=headers)
+        self.assertEqual(rv.json["usage_media"], size)
+        rv = self.client.delete(f"/api/media/{handle}", headers=headers)
+        self.assertEqual(rv.status_code, 200)
+        rv = self.client.get("/api/trees/-", headers=headers)
+        self.assertEqual(rv.json["usage_media"], 0)

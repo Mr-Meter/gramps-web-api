@@ -22,11 +22,9 @@
 
 import unittest
 from unittest.mock import patch, MagicMock
-from urllib.parse import quote
-
 
 from . import BASE_URL, get_test_client
-from .util import fetch_header
+from .util import clear_token_cache, fetch_header
 
 from gramps_webapi.auth.const import ROLE_EDITOR, ROLE_OWNER
 
@@ -34,7 +32,7 @@ TEST_URL = BASE_URL + "/chat/"
 
 
 class TestChat(unittest.TestCase):
-    """Test cases for semantic search."""
+    """Test cases for the chat endpoint."""
 
     @classmethod
     def setUpClass(cls):
@@ -55,20 +53,6 @@ class TestChat(unittest.TestCase):
         }
         rv = cls.client.post("/api/notes/", json=obj, headers=header)
         assert rv.status_code == 201
-        rv = cls.client.get("/api/metadata/", json=obj, headers=header)
-        assert rv.status_code == 200
-        assert rv.json["search"]["sifts"]["count_semantic"] == 2
-
-    def test_search(self):
-        header = fetch_header(self.client, empty_db=True)
-        query = "What should I have for dinner tonight?"
-        rv = self.client.get(
-            f"/api/search/?semantic=1&query={quote(query)}", headers=header
-        )
-        assert rv.status_code == 200
-        assert len(rv.json) == 2
-        assert rv.json[0]["object"]["gramps_id"] == "N02"  # Pizza!
-        assert rv.json[1]["object"]["gramps_id"] == "N01"
 
     @patch("gramps_webapi.api.llm.create_agent")
     def test_chat(self, mock_create_agent):
@@ -102,6 +86,8 @@ class TestChat(unittest.TestCase):
             f"/api/trees/{tree_id}", json={"min_role_ai": ROLE_OWNER}, headers=header
         )
         assert rv.status_code == 200
+        # the permissions in the tokens depend on the setting
+        clear_token_cache()
         header = fetch_header(self.client, empty_db=True)
         header_editor = fetch_header(self.client, empty_db=True, role=ROLE_EDITOR)
         query = "What should I have for dinner tonight?"
@@ -148,6 +134,8 @@ class TestChat(unittest.TestCase):
             f"/api/trees/{tree_id}", json={"min_role_ai": ROLE_OWNER}, headers=header
         )
         assert rv.status_code == 200
+        # the permissions in the tokens depend on the setting
+        clear_token_cache()
 
         # Refresh header after setting permissions
         header = fetch_header(self.client, empty_db=True)
@@ -194,6 +182,8 @@ class TestChat(unittest.TestCase):
             f"/api/trees/{tree_id}", json={"min_role_ai": ROLE_OWNER}, headers=header
         )
         assert rv.status_code == 200
+        # the permissions in the tokens depend on the setting
+        clear_token_cache()
 
         header = fetch_header(self.client, empty_db=True)
         query = "What should I have for dinner tonight?"
@@ -248,6 +238,8 @@ class TestChat(unittest.TestCase):
             f"/api/trees/{tree_id}", json={"min_role_ai": ROLE_OWNER}, headers=header
         )
         assert rv.status_code == 200
+        # the permissions in the tokens depend on the setting
+        clear_token_cache()
         header = fetch_header(self.client, empty_db=True)
 
         # First turn — verify message_history_raw is returned
