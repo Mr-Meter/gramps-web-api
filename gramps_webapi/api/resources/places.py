@@ -36,7 +36,7 @@ from .base import (
     GrampsObjectResourceHelper,
     GrampsObjectsProtectedResource,
 )
-from .schemas import PlaceCoordinatesSchema
+from .schemas import PlaceCoordinatesArgs, PlaceCoordinatesSchema
 from .util import (
     get_extended_attributes,
     get_place_coordinates,
@@ -78,9 +78,11 @@ class PlaceCoordinatesResource(ProtectedResource):
     """Place coordinates resource."""
 
     @api_blueprint.response(200, PlaceCoordinatesSchema(many=True))
+    @api_blueprint.arguments(PlaceCoordinatesArgs, location="query")
     @request_cache_decorator
-    def get(self) -> Response:
+    def get(self, args: Dict) -> Response:
         """Get the name and coordinates of all places, in no particular order."""
+        # the locale is read by the content translation (api.translate)
         places = []
         for place in get_db_handle().iter_places():
             latitude, longitude = get_place_coordinates(place)

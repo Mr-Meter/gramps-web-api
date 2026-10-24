@@ -42,6 +42,7 @@ from ..auth import require_permissions
 from ..blueprint import api_blueprint
 from ..cache import request_cache_decorator
 from ..tasks import run_task, update_search_indices_from_transaction
+from ..translate import restore_originals
 from ..util import (
     check_quota_people,
     get_db_handle,
@@ -368,6 +369,10 @@ class GrampsObjectResource(GrampsObjectResourceHelper, Resource):
         for etag in request.if_match:
             if etag != get_etag:
                 abort_with_message(412, "Resource does not match provided ETag")
+        # the client may have been shown this object translated
+        restore_originals(
+            request.json, self.extract_objects(obj_old), self.gramps_class_name
+        )
         obj = self._parse_object()
         if not obj:
             abort_with_message(400, "Empty object")

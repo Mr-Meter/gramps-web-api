@@ -148,3 +148,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# content translation cache (CONTENT_TRANSLATION_DB) in dev runs
+translations.sqlite*

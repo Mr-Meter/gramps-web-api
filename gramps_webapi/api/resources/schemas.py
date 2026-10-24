@@ -501,6 +501,18 @@ class PlaceProfileSchema(_Base):
     )
 
 
+class PlaceCoordinatesArgs(_Base):
+    """Query arguments for GET /places/coordinates/."""
+
+    locale = fields.Str(
+        load_default=None,
+        validate=validate.Length(min=1, max=5),
+        metadata={
+            "description": "Language code of the reader: place names are shown translated (English or Russian)."
+        },
+    )
+
+
 class PlaceCoordinatesSchema(_Base):
     """A place's handle, name, and coordinates."""
 

@@ -45,6 +45,7 @@ from ..auth import TaskTree, get_owner_emails
 from ..auth import user_db
 from ..branch_guard import BranchPermissionError
 from .succession import evaluate_all_trees, evaluate_tree
+from .translate.machine import translate_missing
 from ..undodb import migrate as migrate_undodb
 from .check import check_database
 from .emails import email_confirm_email, email_new_user, email_reset_pw
@@ -895,6 +896,21 @@ def update_search_indices_from_transaction(
             _index_objects(indexer_semantic, trans_dict, db_handle)
     finally:
         close_db(db_handle)
+
+
+@shared_task(bind=True, max_retries=150)
+def translate_content(self, keys: list[list[str]]) -> int:
+    """Machine-translate strings of the tree for the translation cache."""
+    done = translate_missing(
+        current_app.config["CONTENT_TRANSLATION_DB"],
+        current_app.config.get("CONTENT_TRANSLATION_MODELS") or "",
+        [(mode, lang, source) for mode, lang, source in keys],
+        # a worker does not wait for the model: e-mails and exports go first
+        blocking=self.request.called_directly,
+    )
+    if done is None:
+        raise self.retry(countdown=2)
+    return done
 
 
 @shared_task()

@@ -23,6 +23,8 @@ x-grampsweb: &grampsweb
     GRAMPSWEB_SECRET_KEY: ${GRAMPSWEB_SECRET_KEY:-}
     # succession: interval (s) between plan checks triggered by requests; 0 - off
     GRAMPSWEB_SUCCESSION_CHECK_INTERVAL: ${GRAMPSWEB_SUCCESSION_CHECK_INTERVAL:-600}
+    # tree content in the reader's language (Russian <-> English); false - off
+    GRAMPSWEB_CONTENT_TRANSLATION: ${GRAMPSWEB_CONTENT_TRANSLATION:-true}
     # outgoing e-mail: e-mail confirmation, password reset, succession notifications
     GRAMPSWEB_EMAIL_HOST: ${GRAMPSWEB_EMAIL_HOST:-localhost}
     GRAMPSWEB_EMAIL_PORT: ${GRAMPSWEB_EMAIL_PORT:-465}

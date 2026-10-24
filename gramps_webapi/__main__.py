@@ -36,6 +36,7 @@ import waitress  # type: ignore
 from .api.search import get_search_indexer, get_semantic_search_indexer
 from .api.succession import evaluate_all_trees, evaluate_tree
 from .api.tasks import send_email_confirm_email, send_email_reset_password
+from .api.translate import translate_tree
 from .types import ProgressCallback
 from .api.util import close_db, get_db_manager, list_trees
 from .app import create_app
@@ -260,6 +261,22 @@ def succession_check(ctx, tree):
         click.echo("No changes.")
 
 
+def _single_tree_id(app) -> str:
+    """Return the ID of the tree of a single-tree setup."""
+    if app.config["TREE"] == TREE_MULTI:
+        raise ValueError("`tree` is required when multi-tree support is enabled.")
+    if app.config.get("TREE_ID"):
+        # TREE_ID takes precedence: use dirname directly
+        return app.config["TREE_ID"]
+    # needed for backwards compatibility!
+    dbmgr = WebDbManager(
+        name=app.config["TREE"],
+        create_if_missing=False,
+        ignore_lock=app.config["IGNORE_DB_LOCK"],
+    )
+    return dbmgr.dirname
+
+
 @cli.group("search", help="Manage the full-text search index.")
 @click.option("--tree", help="Tree ID", default=None)
 @click.option(
@@ -270,20 +287,7 @@ def succession_check(ctx, tree):
 @click.pass_context
 def search(ctx, tree, semantic):
     app = ctx.obj["app"]
-    if not tree:
-        if app.config["TREE"] == TREE_MULTI:
-            raise ValueError("`tree` is required when multi-tree support is enabled.")
-        if app.config.get("TREE_ID"):
-            # TREE_ID takes precedence: use dirname directly
-            tree = app.config["TREE_ID"]
-        else:
-            # needed for backwards compatibility!
-            dbmgr = WebDbManager(
-                name=app.config["TREE"],
-                create_if_missing=False,
-                ignore_lock=app.config["IGNORE_DB_LOCK"],
-            )
-            tree = dbmgr.dirname
+    tree = tree or _single_tree_id(app)
     with app.app_context():
         ctx.obj["db_manager"] = get_db_manager(tree=tree)
         ctx.obj["tree"] = tree
@@ -368,6 +372,28 @@ def index_incremental(ctx):
     finally:
         close_db(db)
     app.logger.info("Done updating search index.")
+
+
+@cli.group("translate", help="Manage the translation of tree content.")
+@click.pass_context
+def translate(ctx):
+    pass
+
+
+@translate.command("all")
+@click.option("--tree", help="Tree ID", default=None)
+@click.pass_context
+def translate_all(ctx, tree):
+    """Translate every string of a tree that is not translated yet."""
+    app = ctx.obj["app"]
+    tree = tree or _single_tree_id(app)
+    with app.app_context():
+        db = get_db_manager(tree=tree).get_db().db
+        try:
+            count = translate_tree(db)
+        finally:
+            close_db(db)
+    click.echo(f"Translated {count} new strings.")
 
 
 @cli.group("tree", help="Manage trees.")

@@ -54,6 +54,14 @@ class DefaultConfig(object):
     BASE_URL = "http://localhost/"
     # seconds between checks of time-based succession plan steps; 0 disables
     SUCCESSION_CHECK_INTERVAL = 600
+    # show tree content in the reader's language, Russian <-> English
+    CONTENT_TRANSLATION = True
+    # directory holding the ru_en and en_ru translation models; empty: names only
+    CONTENT_TRANSLATION_MODELS = ""
+    CONTENT_TRANSLATION_DB = str(Path.cwd() / "translations.sqlite")
+    # seconds a request waits for strings it sent to translation; it holds a
+    # web worker meanwhile
+    CONTENT_TRANSLATION_WAIT = 3
     CORS_EXPOSE_HEADERS = ["X-Total-Count"]
     STATIC_PATH = "static"
     REQUEST_CACHE_CONFIG = {

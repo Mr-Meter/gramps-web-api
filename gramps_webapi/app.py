@@ -55,6 +55,7 @@ from .api.search.embeddings import create_remote_embedding_function, load_model
 from .api.succession import should_check_now
 from .api.tasks import check_succession, run_task, send_telemetry_task
 from .api.telemetry import get_server_uuid, should_send_telemetry
+from .api.translate import translate_response
 from .api.util import close_db, get_tree_from_jwt
 from .auth import user_db
 from .auth.oidc import init_oidc
@@ -379,6 +380,10 @@ def create_app(config: Optional[Dict[str, Any]] = None, config_from_env: bool = 
                 run_task(send_telemetry_task, tree=tree_id)
         except Exception as exc:
             _LOG.warning("Telemetry error: %s", exc)
+
+    # tree content in the reader's language; registered after Compress, so
+    # it runs before the compression
+    app.after_request(translate_response)
 
     @app.teardown_appcontext
     def close_db_connection(exception) -> None:
